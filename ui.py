@@ -15,10 +15,12 @@ from PyQt5.QtGui import QImage, QPixmap, QColor, QPainter, QPen
 from PIL import ImageFont, ImageDraw, Image
 import cv2
 import requests
-import base64
+from util import model_prediction, reader
 from queue import Queue
 import socket
 import os
+
+from util import draw_license_plate_text
 
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -31,16 +33,6 @@ def get_available_usb_cameras(max_to_check=5):
             available_cameras.append(i)
             cap.release()
     return available_cameras
-
-def draw_cyrillic_text(image, text, position, font_path, font_size, color):
-    pil_image = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
-    font = ImageFont.truetype(font_path, font_size)
-    draw = ImageDraw.Draw(pil_image)
-    shadow_position = (position[0] + 2, position[1] + 2)
-    draw.text(shadow_position, text, font=font, fill=(0, 0, 0))
-    draw.text(position, text, font=font, fill=color)
-    return cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
-
 
 class StatusIndicator(QLabel):
     def __init__(self, parent=None):
@@ -225,6 +217,11 @@ class VideoApp(QWidget):
         self.insert_car_data = insert_car_data
         self.usb_camera_index = 0
 
+        # Добавляем переменную для хранения текущего изображения
+        self.current_image = None
+        self.image_files = []
+        self.current_image_index = 0
+
         # Server settings
         self.server_ip = "192.168.1.159"
         self.server_port = "8765"
@@ -312,6 +309,20 @@ class VideoApp(QWidget):
         self.load_video_action.triggered.connect(self.load_video_file)
         self.file_menu.addAction(self.load_video_action)
 
+        # Добавляем пункт для загрузки изображений
+        self.load_image_action = QAction("Загрузить изображение(я)", self)
+        self.load_image_action.triggered.connect(self.load_image_files)
+        self.file_menu.addAction(self.load_image_action)
+
+        # Добавляем пункты для навигации по изображениям
+        self.next_image_action = QAction("Следующее изображение", self)
+        self.next_image_action.triggered.connect(self.show_next_image)
+        self.file_menu.addAction(self.next_image_action)
+
+        self.prev_image_action = QAction("Предыдущее изображение", self)
+        self.prev_image_action.triggered.connect(self.show_prev_image)
+        self.file_menu.addAction(self.prev_image_action)
+
         self.exit_action = QAction("Выход", self)
         self.exit_action.triggered.connect(self.close)
         self.file_menu.addAction(self.exit_action)
@@ -370,6 +381,79 @@ class VideoApp(QWidget):
         self.status_bar.addStretch()
 
         layout.addLayout(self.status_bar)
+
+    def load_image_files(self):
+        """Загрузка одного или нескольких изображений"""
+        options = QFileDialog.Options()
+        files, _ = QFileDialog.getOpenFileNames(
+            self, "Выберите изображение(я)", "",
+            "Images (*.png *.jpg *.jpeg *.bmp);;All Files (*)",
+            options=options
+        )
+
+        if files:
+            self.image_files = files
+            self.current_image_index = 0
+            self.load_and_process_image(self.image_files[0])
+            self.current_camera = "Изображение"
+            self.update_camera_buttons()
+
+    def load_and_process_image(self, file_path):
+        """Загрузка и обработка одного изображения"""
+        try:
+            self.current_image = cv2.imread(file_path)
+            if self.current_image is not None:
+                # Останавливаем таймер, если он активен
+                if self.timer.isActive():
+                    self.timer.stop()
+
+                # Обрабатываем изображение
+                results = model_prediction(
+                    self.current_image,
+                    self.coco_model,
+                    self.license_plate_detector,
+                    reader
+                )
+
+                if len(results) == 3:
+                    # Найдены и распознаны номера
+                    prediction, texts, license_plate_crop = results
+                    self.display_processed_image(prediction)
+                    self.plate_text_display.clear()
+                    for text in texts:
+                        if text:
+                            self.plate_text_display.append(text)
+                elif len(results) == 2:
+                    # Либо номера не найдены, либо текст не распознан
+                    prediction, messages = results
+                    self.display_processed_image(prediction)
+                    self.plate_text_display.clear()
+                    for msg in messages:
+                        self.plate_text_display.append(msg)
+        except Exception as e:
+            logging.error(f"Error processing image: {e}")
+            QMessageBox.warning(self, "Ошибка", f"Ошибка при обработке изображения: {str(e)}")
+
+    def display_processed_image(self, image):
+        """Отображение обработанного изображения"""
+        height, width, channel = image.shape
+        bytes_per_line = 3 * width
+        q_img = QImage(image.data, width, height, bytes_per_line, QImage.Format_RGB888)
+        pixmap = QPixmap.fromImage(q_img)
+        pixmap = pixmap.scaled(self.video_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.video_label.setPixmap(pixmap)
+
+    def show_next_image(self):
+        """Показать следующее изображение из списка"""
+        if self.image_files and self.current_image_index < len(self.image_files) - 1:
+            self.current_image_index += 1
+            self.load_and_process_image(self.image_files[self.current_image_index])
+
+    def show_prev_image(self):
+        """Показать предыдущее изображение из списка"""
+        if self.image_files and self.current_image_index > 0:
+            self.current_image_index -= 1
+            self.load_and_process_image(self.image_files[self.current_image_index])
 
     def update_connection_status(self, status):
         self.connection_status = status
@@ -674,30 +758,30 @@ class VideoApp(QWidget):
             if self.connection_status == "connected":
                 self.connection_status_changed.emit("disconnected")
 
-    def send_frame(self, frame):
-        try:
-            if not self.server_ip or not self.server_port:
-                logging.error("Server IP or port not set")
-                return
-
-            small_frame = cv2.resize(frame, (1280, 720))
-            encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 70]
-            _, buffer = cv2.imencode('.jpg', small_frame, encode_param)
-            jpg_as_text = base64.b64encode(buffer).decode('utf-8')
-            response = requests.post(
-                f"http://{self.server_ip}:{self.server_port}/upload",
-                json={"frame": jpg_as_text},
-                timeout=0.5
-            )
-            if response.status_code != 200:
-                logging.error(f"Server error: {response.status_code} - {response.text}")
-                self.connection_status_changed.emit("disconnected")
-        except requests.exceptions.RequestException as e:
-            logging.error(f"Network error: {e}")
-            self.connection_status_changed.emit("disconnected")
-        except Exception as e:
-            logging.error(f"Error in send_frame: {e}")
-            self.connection_status_changed.emit("disconnected")
+    # def send_frame(self, frame):
+    #     try:
+    #         if not self.server_ip or not self.server_port:
+    #             logging.error("Server IP or port not set")
+    #             return
+    #
+    #         small_frame = cv2.resize(frame, (1280, 720))
+    #         encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 70]
+    #         _, buffer = cv2.imencode('.jpg', small_frame, encode_param)
+    #         jpg_as_text = base64.b64encode(buffer).decode('utf-8')
+    #         response = requests.post(
+    #             f"http://{self.server_ip}:{self.server_port}/upload",
+    #             json={"frame": jpg_as_text},
+    #             timeout=0.5
+    #         )
+    #         if response.status_code != 200:
+    #             logging.error(f"Server error: {response.status_code} - {response.text}")
+    #             self.connection_status_changed.emit("disconnected")
+    #     except requests.exceptions.RequestException as e:
+    #         logging.error(f"Network error: {e}")
+    #         self.connection_status_changed.emit("disconnected")
+    #     except Exception as e:
+    #         logging.error(f"Error in send_frame: {e}")
+    #         self.connection_status_changed.emit("disconnected")
 
     def set_fps_limit(self):
         try:
@@ -743,115 +827,92 @@ class VideoApp(QWidget):
             start_time = time.time()
             frame = None
 
+            # Получение кадра из выбранного источника
             if self.current_camera == "Камера 1" and self.cap1 and self.cap1.isOpened():
                 ret, frame = self.cap1.read()
-                if not ret:
-                    logging.warning("Failed to read frame from camera 1. Resetting stream position.")
-                    self.cap1.set(cv2.CAP_PROP_POS_FRAMES, 0)
-
             elif self.current_camera == "Камера 2" and self.cap2 and self.cap2.isOpened():
                 ret, frame = self.cap2.read()
-                if not ret:
-                    logging.warning("Failed to read frame from camera 2. Resetting stream position.")
-                    self.cap2.set(cv2.CAP_PROP_POS_FRAMES, 0)
-
             elif self.current_camera == "USB Камера" and hasattr(self, 'usb_cap') and self.usb_cap.isOpened():
                 ret, frame = self.usb_cap.read()
-                if not ret:
-                    logging.warning("Failed to read frame from USB camera.")
-
             elif self.current_camera == "Видеофайл" and self.video_cap and self.video_cap.isOpened():
                 ret, frame = self.video_cap.read()
-                if not ret:
-                    logging.warning("Failed to read frame from video file. Resetting stream position.")
-                    self.video_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
-            if frame is None:
+            if frame is None or not ret:
                 return
 
             frame = cv2.resize(frame, (1920, 1080))
+            img_to_process = frame.copy()
 
-            try:
-                detections = self.coco_model(frame)[0]
-                detections_ = []
-                car_type = None
-                car_detections = {}
-                for detection in detections.boxes.data.tolist():
-                    x1, y1, x2, y2, score, class_id = detection
-                    if int(class_id) in self.vehicles:
-                        detections_.append([x1, y1, x2, y2, score])
-                        car_detections[(x1, y1, x2, y2)] = int(class_id)
-                        if int(class_id) == 2:
-                            car_type = "Car"
-                        elif int(class_id) == 7:
-                            car_type = "Truck"
-                logging.debug(f"Detected vehicles: {detections_}")
-            except Exception as e:
-                logging.error(f"Error during vehicle detection: {e}")
-                return
+            # Детекция транспортных средств
+            detections = self.coco_model(img_to_process)[0]
+            detections_ = []
+            car_type = None
+            car_detections = {}
 
-            try:
-                if detections_:
-                    track_ids = self.mot_tracker.update(np.asarray(detections_))
-                    logging.debug(f"Track IDs: {track_ids}")
-                else:
-                    logging.debug("No vehicles detected to track.")
-                    track_ids = []
-            except Exception as e:
-                logging.error(f"Error during vehicle tracking: {e}")
-                return
+            for detection in detections.boxes.data.tolist():
+                x1, y1, x2, y2, score, class_id = detection
+                if int(class_id) in self.vehicles:
+                    detections_.append([x1, y1, x2, y2, score])
+                    car_detections[(x1, y1, x2, y2)] = int(class_id)
+                    cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 0, 255), 3)
 
-            try:
-                license_plates = self.license_plate_detector(frame)[0]
-                for license_plate in license_plates.boxes.data.tolist():
-                    x1, y1, x2, y2, score, class_id = license_plate
-                    xcar1, ycar1, xcar2, ycar2, car_id = self.get_car(license_plate, track_ids)
-                    if car_id != -1:
-                        license_plate_crop = frame[int(y1):int(y2), int(x1): int(x2), :]
-                        license_plate_text, _ = self.read_license_plate(license_plate_crop)
-                        if license_plate_text and license_plate_text not in self.recognized_plates:
-                            self.recognized_plates.add(license_plate_text)
-                            self.plate_text_display.append(license_plate_text)
-                            logging.info(f"Recognized license plate: {license_plate_text}")
-                            car_key = (xcar1, ycar1, xcar2, ycar2)
-                            if car_key in car_detections:
-                                car_type = "Car" if car_detections[car_key] == 2 else "Truck"
-                            car_image = frame[int(ycar1):int(ycar2), int(xcar1):int(xcar2), :]
-                            _, buffer = cv2.imencode('.jpg', car_image)
-                            if buffer is None:
-                                logging.error("Failed to encode image to binary data.")
-                                return
-                            photo_bytes = buffer.tobytes()
-                            current_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                            self.insert_car_data(license_plate_text, photo_bytes, car_type, current_date)
-                            logging.info(
-                                f"Sent data to the database: license_plate={license_plate_text}, photo_size={len(photo_bytes)} bytes, car_type={car_type}, date={current_date}")
-                        plate_display = cv2.resize(license_plate_crop, (256, 128))
-                        frame[10:138, 10:266] = cv2.cvtColor(plate_display, cv2.COLOR_BGR2RGB)
-                        cv2.rectangle(frame, (int(xcar1), int(ycar1)), (int(xcar2), int(ycar2)), (0, 255, 0), 3)
-                        cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 0, 255), 2)
-                        if license_plate_text:
-                            frame = draw_cyrillic_text(
-                                frame,
-                                license_plate_text,
-                                (int(x1), int(y1) - 10),
-                                "DejaVuSans.ttf",
-                                30,
-                                (255, 255, 255)
-                            )
-            except Exception as e:
-                logging.error(f"Error during license plate detection: {e}")
-                return
+            # Трекинг транспортных средств
+            track_ids = self.mot_tracker.update(np.asarray(detections_)) if detections_ else []
 
+            # Детекция номерных знаков
+            license_plates = self.license_plate_detector(img_to_process)[0]
+            for license_plate in license_plates.boxes.data.tolist():
+                x1, y1, x2, y2, score, class_id = license_plate
+
+                # Находим автомобиль, которому принадлежит номер
+                xcar1, ycar1, xcar2, ycar2, car_id = self.get_car(license_plate, track_ids)
+
+                if car_id != -1:
+                    license_plate_crop = img_to_process[int(y1):int(y2), int(x1):int(x2), :]
+                    license_plate_crop_gray = cv2.cvtColor(license_plate_crop, cv2.COLOR_BGR2GRAY)
+
+                    # Распознавание номера
+                    license_plate_text, license_plate_text_score = self.read_license_plate(license_plate_crop_gray)
+
+                    if license_plate_text and license_plate_text not in self.recognized_plates:
+                        self.recognized_plates.add(license_plate_text)
+                        self.plate_text_display.append(license_plate_text)
+
+                        # Определение типа автомобиля
+                        car_key = (xcar1, ycar1, xcar2, ycar2)
+                        if car_key in car_detections:
+                            car_type = "Car" if car_detections[car_key] == 2 else "Truck"
+
+                        # # Сохранение данных в БД
+                        # car_image = img_to_process[int(ycar1):int(ycar2), int(xcar1):int(xcar2), :]
+                        # _, buffer = cv2.imencode('.jpg', car_image)
+                        # photo_bytes = buffer.tobytes()
+                        # current_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                        # self.insert_car_data(license_plate_text, photo_bytes, car_type, current_date)
+
+                    # Отрисовка прямоугольника вокруг номера
+                    cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
+
+                    if license_plate_text:
+                        # Отрисовка текста номерного знака в вашем стиле
+                        text_position = (int(x1) - 40, int(y1) - 40)
+                        frame = draw_license_plate_text(frame, license_plate_text, text_position)
+
+            # Отображение FPS
             end_time = time.time()
             self.frame_times.append(end_time - start_time)
             if len(self.frame_times) > 10:
                 self.frame_times.pop(0)
             current_fps = len(self.frame_times) / sum(self.frame_times)
-            if self.show_fps:
-                cv2.putText(frame, f"FPS: {current_fps:.2f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1,
-                            (255, 255, 255), 2, cv2.LINE_AA)
 
+            if self.show_fps:
+                frame = draw_license_plate_text(
+                    frame,
+                    f"FPS: {current_fps:.2f}",
+                    (10, 10)
+                )
+
+            # Отображение обработанного кадра
             processed_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             height, width, channel = processed_frame.shape
             q_img = QImage(processed_frame.data, width, height, width * channel, QImage.Format_RGB888)
@@ -864,9 +925,9 @@ class VideoApp(QWidget):
                     self.frame_queue.put_nowait(processed_frame.copy())
                 except queue.Full:
                     pass
+
         except Exception as e:
             logging.error(f"Error in update_frame: {e}")
-            # Попытка восстановить подключение к камере
             if self.timer.isActive():
                 self.restart_video_streams()
 
