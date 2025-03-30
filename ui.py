@@ -1,4 +1,5 @@
 # ui.py
+import base64
 import logging
 import queue
 from datetime import datetime
@@ -15,7 +16,7 @@ from PyQt5.QtGui import QImage, QPixmap, QColor, QPainter, QPen
 from PIL import ImageFont, ImageDraw, Image
 import cv2
 import requests
-from util import model_prediction, reader
+from util import model_prediction, reader, draw_best_result
 from queue import Queue
 import socket
 import os
@@ -218,9 +219,13 @@ class VideoApp(QWidget):
         self.usb_camera_index = 0
 
         # Добавляем переменную для хранения текущего изображения
-        self.current_image = None
-        self.image_files = []
-        self.current_image_index = 0
+        self.best_text = None
+        self.best_score = 0.0
+        self.last_direction = None
+
+        self.last_recognized_plate = None
+        self.last_recognized_score = 0.0
+
 
         # Server settings
         self.server_ip = "192.168.1.159"
@@ -758,30 +763,30 @@ class VideoApp(QWidget):
             if self.connection_status == "connected":
                 self.connection_status_changed.emit("disconnected")
 
-    # def send_frame(self, frame):
-    #     try:
-    #         if not self.server_ip or not self.server_port:
-    #             logging.error("Server IP or port not set")
-    #             return
-    #
-    #         small_frame = cv2.resize(frame, (1280, 720))
-    #         encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 70]
-    #         _, buffer = cv2.imencode('.jpg', small_frame, encode_param)
-    #         jpg_as_text = base64.b64encode(buffer).decode('utf-8')
-    #         response = requests.post(
-    #             f"http://{self.server_ip}:{self.server_port}/upload",
-    #             json={"frame": jpg_as_text},
-    #             timeout=0.5
-    #         )
-    #         if response.status_code != 200:
-    #             logging.error(f"Server error: {response.status_code} - {response.text}")
-    #             self.connection_status_changed.emit("disconnected")
-    #     except requests.exceptions.RequestException as e:
-    #         logging.error(f"Network error: {e}")
-    #         self.connection_status_changed.emit("disconnected")
-    #     except Exception as e:
-    #         logging.error(f"Error in send_frame: {e}")
-    #         self.connection_status_changed.emit("disconnected")
+    def send_frame(self, frame):
+        try:
+            if not self.server_ip or not self.server_port:
+                logging.error("Server IP or port not set")
+                return
+
+            small_frame = cv2.resize(frame, (1280, 720))
+            encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 70]
+            _, buffer = cv2.imencode('.jpg', small_frame, encode_param)
+            jpg_as_text = base64.b64encode(buffer).decode('utf-8')
+            response = requests.post(
+                f"http://{self.server_ip}:{self.server_port}/upload",
+                json={"frame": jpg_as_text},
+                timeout=0.5
+            )
+            if response.status_code != 200:
+                logging.error(f"Server error: {response.status_code} - {response.text}")
+                self.connection_status_changed.emit("disconnected")
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Network error: {e}")
+            self.connection_status_changed.emit("disconnected")
+        except Exception as e:
+            logging.error(f"Error in send_frame: {e}")
+            self.connection_status_changed.emit("disconnected")
 
     def set_fps_limit(self):
         try:
@@ -820,116 +825,193 @@ class VideoApp(QWidget):
             QMessageBox.critical(self, "Ошибка", f"Ошибка при переключении паузы: {str(e)}")
 
     def update_frame(self):
-        if not any([self.cap1, self.cap2, self.video_cap, hasattr(self, 'usb_cap')]):
-            return
-
         try:
-            start_time = time.time()
-            frame = None
-
-            # Получение кадра из выбранного источника
-            if self.current_camera == "Камера 1" and self.cap1 and self.cap1.isOpened():
-                ret, frame = self.cap1.read()
-            elif self.current_camera == "Камера 2" and self.cap2 and self.cap2.isOpened():
-                ret, frame = self.cap2.read()
-            elif self.current_camera == "USB Камера" and hasattr(self, 'usb_cap') and self.usb_cap.isOpened():
-                ret, frame = self.usb_cap.read()
-            elif self.current_camera == "Видеофайл" and self.video_cap and self.video_cap.isOpened():
-                ret, frame = self.video_cap.read()
-
-            if frame is None or not ret:
+            if not any([self.cap1, self.cap2, self.video_cap, hasattr(self, 'usb_cap')]):
                 return
 
-            frame = cv2.resize(frame, (1920, 1080))
-            img_to_process = frame.copy()
+            start_time = time.time()
+            ret, frame = self.get_current_frame()
+            if not ret or frame is None:
+                return
 
-            # Детекция транспортных средств
-            detections = self.coco_model(img_to_process)[0]
-            detections_ = []
-            car_type = None
-            car_detections = {}
+            # frame = cv2.resize(frame, (1920, 1080))
+            results = model_prediction(frame, self.coco_model, self.license_plate_detector, reader)
 
-            for detection in detections.boxes.data.tolist():
-                x1, y1, x2, y2, score, class_id = detection
-                if int(class_id) in self.vehicles:
-                    detections_.append([x1, y1, x2, y2, score])
-                    car_detections[(x1, y1, x2, y2)] = int(class_id)
-                    cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 0, 255), 3)
+            # Обработка всех обнаруженных номеров
+            if len(results) >= 6:  # Теперь возвращается 6 значений
+                processed_frame, texts, crops, current_best_text, current_best_score, direction = results
 
-            # Трекинг транспортных средств
-            track_ids = self.mot_tracker.update(np.asarray(detections_)) if detections_ else []
+                # Обновляем лучший результат
+                if current_best_score > self.best_score:
+                    self.best_text = current_best_text
+                    self.best_score = current_best_score
+                    self.last_direction = direction
+                    logging.info(
+                        f"Новый лучший результат: {self.best_text} ({self.best_score:.2f}), направление: {direction}")
 
-            # Детекция номерных знаков
-            license_plates = self.license_plate_detector(img_to_process)[0]
-            for license_plate in license_plates.boxes.data.tolist():
-                x1, y1, x2, y2, score, class_id = license_plate
+                # Новая логика вывода номеров
+                if current_best_score > 0.85:
+                    if self.last_recognized_plate != current_best_text:
+                        display_text = f"{current_best_text} ({current_best_score:.2f})"
+                        if direction:
+                            display_text += f" {direction}"
+                        self.plate_text_display.append(display_text)
+                        self.last_recognized_plate = current_best_text
+                        self.last_recognized_score = current_best_score
 
-                # Находим автомобиль, которому принадлежит номер
-                xcar1, ycar1, xcar2, ycar2, car_id = self.get_car(license_plate, track_ids)
+                        _, buffer = cv2.imencode('.jpg', processed_frame)
+                        if buffer is not None:
+                            photo_bytes = buffer.tobytes()
+                            current_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                            car_type = "Car"  # Можно определить более точно из результатов детекции
+                            self.insert_car_data(
+                                self.last_recognized_plate,
+                                photo_bytes,
+                                car_type,
+                                current_date
+                            )
 
-                if car_id != -1:
-                    license_plate_crop = img_to_process[int(y1):int(y2), int(x1):int(x2), :]
-                    license_plate_crop_gray = cv2.cvtColor(license_plate_crop, cv2.COLOR_BGR2GRAY)
-
-                    # Распознавание номера
-                    license_plate_text, license_plate_text_score = self.read_license_plate(license_plate_crop_gray)
-
-                    if license_plate_text and license_plate_text not in self.recognized_plates:
-                        self.recognized_plates.add(license_plate_text)
-                        self.plate_text_display.append(license_plate_text)
-
-                        # Определение типа автомобиля
-                        car_key = (xcar1, ycar1, xcar2, ycar2)
-                        if car_key in car_detections:
-                            car_type = "Car" if car_detections[car_key] == 2 else "Truck"
-
-                        # # Сохранение данных в БД
-                        # car_image = img_to_process[int(ycar1):int(ycar2), int(xcar1):int(xcar2), :]
-                        # _, buffer = cv2.imencode('.jpg', car_image)
-                        # photo_bytes = buffer.tobytes()
-                        # current_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                        # self.insert_car_data(license_plate_text, photo_bytes, car_type, current_date)
-
-                    # Отрисовка прямоугольника вокруг номера
-                    cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
-
-                    if license_plate_text:
-                        # Отрисовка текста номерного знака в вашем стиле
-                        text_position = (int(x1) - 40, int(y1) - 40)
-                        frame = draw_license_plate_text(frame, license_plate_text, text_position)
+                        logging.info(f"Отображен новый номер: {current_best_text}, направление: {direction}")
 
             # Отображение FPS
-            end_time = time.time()
-            self.frame_times.append(end_time - start_time)
-            if len(self.frame_times) > 10:
-                self.frame_times.pop(0)
-            current_fps = len(self.frame_times) / sum(self.frame_times)
-
             if self.show_fps:
-                frame = draw_license_plate_text(
-                    frame,
+                current_fps = self.calculate_fps(start_time)
+                processed_frame = draw_license_plate_text(
+                    processed_frame,
                     f"FPS: {current_fps:.2f}",
                     (10, 10)
                 )
 
-            # Отображение обработанного кадра
-            processed_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            height, width, channel = processed_frame.shape
-            q_img = QImage(processed_frame.data, width, height, width * channel, QImage.Format_RGB888)
-            pixmap = QPixmap.fromImage(q_img)
-            pixmap = pixmap.scaled(self.video_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            self.video_label.setPixmap(pixmap)
+            # Всегда отображаем лучший результат, если он есть
+            if self.last_recognized_plate and self.last_recognized_score > 0.85:
+                display_text = f"{self.last_recognized_plate} ({self.last_recognized_score:.2f})"
+                if self.last_direction:
+                    display_text += f" {self.last_direction}"
+
+                processed_frame = draw_best_result(
+                    processed_frame,
+                    display_text,
+                    self.last_recognized_score,
+                    (350, 10)
+                )
+
+            self.display_processed_frame(processed_frame)
 
             if self.is_streaming:
-                try:
-                    self.frame_queue.put_nowait(processed_frame.copy())
-                except queue.Full:
-                    pass
+                self.send_frame_to_stream(processed_frame)
 
         except Exception as e:
             logging.error(f"Error in update_frame: {e}")
-            if self.timer.isActive():
-                self.restart_video_streams()
+
+    # def update_frame(self):
+    #     try:
+    #         if not any([self.cap1, self.cap2, self.video_cap, hasattr(self, 'usb_cap')]):
+    #             return
+    #
+    #         start_time = time.time()
+    #         ret, frame = self.get_current_frame()
+    #         if not ret or frame is None:
+    #             return
+    #
+    #         frame = cv2.resize(frame, (1920, 1080))
+    #         results = model_prediction(frame, self.coco_model, self.license_plate_detector, reader)
+    #
+    #         # Обработка всех обнаруженных номеров
+    #         if len(results) >= 6:  # Теперь возвращается 6 значений
+    #             processed_frame, texts, crops, current_best_text, current_best_score, direction = results
+    #
+    #             # Обновляем лучший результат
+    #             if current_best_score > getattr(self, 'best_score', 0):
+    #                 self.best_text = current_best_text
+    #                 self.best_score = current_best_score
+    #                 self.last_direction = direction  # Сохраняем направление
+    #                 logging.info(
+    #                     f"Новый лучший результат: {self.best_text} ({self.best_score:.2f}), направление: {direction}")
+    #
+    #             # Новая логика вывода номеров
+    #             if current_best_score > 0.85:
+    #                 if self.last_recognized_plate != current_best_text:
+    #                     # Это новый номер, отличающийся от предыдущего
+    #                     display_text = f"{current_best_text} ({current_best_score:.2f})"
+    #                     if direction:
+    #                         display_text += f" ({direction})"
+    #                     self.plate_text_display.append(display_text)
+    #                     self.last_recognized_plate = current_best_text
+    #                     self.last_recognized_score = current_best_score
+    #                     logging.info(f"Отображен новый номер: {current_best_text}, направление: {direction}")
+    #
+    #         # Отображение FPS
+    #         if self.show_fps:
+    #             current_fps = self.calculate_fps(start_time)
+    #             processed_frame = draw_license_plate_text(
+    #                 processed_frame,
+    #                 f"FPS: {current_fps:.2f}",
+    #                 (10, 10)
+    #             )
+    #
+    #         # Отображение лучшего результата с направлением
+    #         if hasattr(self, 'best_text') and hasattr(self, 'best_score'):
+    #             if self.best_score > 0.85:
+    #                 display_text = f"{self.best_text} ({self.best_score:.2f})"
+    #                 if hasattr(self, 'last_direction') and self.last_direction:
+    #                     display_text += f" {self.last_direction}"
+    #
+    #                 processed_frame = draw_best_result(
+    #                     processed_frame,
+    #                     display_text,
+    #                     self.best_score,
+    #                     (10, 350)
+    #                 )
+    #
+    #         self.display_processed_frame(processed_frame)
+    #
+    #         if self.is_streaming:
+    #             self.send_frame_to_stream(processed_frame)
+    #
+    #     except Exception as e:
+    #         logging.error(f"Error in update_frame: {e}")
+
+    def get_current_frame(self):
+        """Получает текущий кадр из активного источника"""
+        if self.current_camera == "Камера 1" and self.cap1 and self.cap1.isOpened():
+            return self.cap1.read()
+        elif self.current_camera == "Камера 2" and self.cap2 and self.cap2.isOpened():
+            return self.cap2.read()
+        elif self.current_camera == "USB Камера" and hasattr(self, 'usb_cap') and self.usb_cap.isOpened():
+            return self.usb_cap.read()
+        elif self.current_camera == "Видеофайл" and self.video_cap and self.video_cap.isOpened():
+            return self.video_cap.read()
+        return False, None
+
+    def process_recognized_texts(self, texts):
+        """Обрабатывает распознанные тексты номеров"""
+        for text in texts:
+            if text and text not in self.recognized_plates:
+                self.recognized_plates.add(text)
+                self.plate_text_display.append(text)
+
+    def calculate_fps(self, start_time):
+        """Вычисляет текущий FPS"""
+        end_time = time.time()
+        self.frame_times.append(end_time - start_time)
+        if len(self.frame_times) > 10:
+            self.frame_times.pop(0)
+        return len(self.frame_times) / sum(self.frame_times)
+
+    def display_processed_frame(self, frame):
+        """Отображает обработанный кадр в интерфейсе"""
+        height, width, channel = frame.shape
+        q_img = QImage(frame.data, width, height, width * channel, QImage.Format_RGB888)
+        pixmap = QPixmap.fromImage(q_img)
+        pixmap = pixmap.scaled(self.video_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.video_label.setPixmap(pixmap)
+
+    def send_frame_to_stream(self, frame):
+        """Отправляет кадр на сервер трансляции"""
+        try:
+            self.frame_queue.put_nowait(frame.copy())
+        except queue.Full:
+            pass
 
     def streaming_worker(self):
         while True:

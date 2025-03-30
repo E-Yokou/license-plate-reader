@@ -1,7 +1,10 @@
+import time
+
 import easyocr
 import logging
 import numpy as np
 import cv2
+import re
 import mysql.connector
 from PIL import ImageFont, ImageDraw, Image
 
@@ -31,66 +34,106 @@ dict_char_to_int = {
 
 dict_int_to_char = {v: k for k, v in dict_char_to_int.items()}
 
+
 def model_prediction(img, coco_model, license_plate_detector, ocr_reader):
-    """
-    Обработка изображения для обнаружения автомобилей и номерных знаков
-    Возвращает:
-    - Если найдены номера: [изображение с разметкой, тексты номеров, изображения номеров]
-    - Если номера не найдены: [изображение с разметкой, сообщение]
-    """
-    license_numbers = 0
-    results = {}
+    """Обработка изображения для обнаружения автомобилей и номерных знаков"""
+    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR) if len(img.shape) == 3 else img
     licenses_texts = []
     license_plate_crops = []
-
-    # Конвертируем изображение в BGR (для OpenCV)
-    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR) if len(img.shape) == 3 else img
+    plates_to_draw = []
+    direction = None
 
     # Детекция транспортных средств
     object_detections = coco_model(img)[0]
+    vehicle_classes = set()  # Храним все обнаруженные классы
+
+    for detection in object_detections.boxes.data.tolist():
+        xcar1, ycar1, xcar2, ycar2, car_score, class_id = detection
+        class_name = coco_model.names[int(class_id)]
+        vehicle_classes.add(int(class_id))
+
+        # Рисуем bounding box
+        if int(class_id) in [2, 3, 5, 7]:  # Транспортные средства
+            cv2.rectangle(img, (int(xcar1), int(ycar1)), (int(xcar2), int(ycar2)), (0, 0, 255), 3)
+        elif int(class_id) in [72, 73]:  # Холодильник или поезд
+            cv2.rectangle(img, (int(xcar1), int(ycar1)), (int(xcar2), int(ycar2)), (255, 0, 0), 3)
+
+    # Определяем направление
+    if {6, 72}.intersection(vehicle_classes):
+        direction = "backward"
+    elif {7}.intersection(vehicle_classes):  # Если есть транспортное средство
+        direction = "forward"
+
+    # Остальной код обработки номеров остается без изменений
     license_detections = license_plate_detector(img)[0]
+    for license_plate in license_detections.boxes.data.tolist():
+        x1, y1, x2, y2, score, class_id = license_plate
 
-    # Отрисовка bounding box'ов для автомобилей
-    if len(object_detections.boxes.cls.tolist()) != 0:
-        for detection in object_detections.boxes.data.tolist():
-            xcar1, ycar1, xcar2, ycar2, car_score, class_id = detection
-            if int(class_id) in [2, 3, 5, 7]:  # Автомобили, грузовики и т.д.
-                cv2.rectangle(img, (int(xcar1), int(ycar1)), (int(xcar2), int(ycar2)), (0, 0, 255), 3)
+        license_plate_crop = img[int(y1):int(y2), int(x1):int(x2), :]
+        license_plate_crop_gray = cv2.cvtColor(license_plate_crop, cv2.COLOR_BGR2GRAY)
 
-    # Детекция и обработка номерных знаков
-    if len(license_detections.boxes.cls.tolist()) != 0:
-        for license_plate in license_detections.boxes.data.tolist():
-            x1, y1, x2, y2, score, class_id = license_plate
+        plate_text, plate_score = read_license_plate(license_plate_crop_gray)
 
-            # Отрисовка прямоугольника вокруг номера
-            cv2.rectangle(img, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
+        if plate_text and plate_score > 0.85:  # Фильтрация по score
+            plates_to_draw.append({
+                'text': plate_text,
+                'score': plate_score,
+                'position': (int(x1), int(y1) - 40),
+                'bbox': (int(x1), int(y1), int(x2), int(y2))
+            })
 
-            # Вырезаем область номера
-            license_plate_crop = img[int(y1):int(y2), int(x1):int(x2), :]
-            license_plate_crop_gray = cv2.cvtColor(license_plate_crop, cv2.COLOR_BGR2GRAY)
+    # Отрисовка всех подходящих номеров
+    for plate in plates_to_draw:
+        cv2.rectangle(img, plate['bbox'][:2], plate['bbox'][2:], (0, 255, 0), 2)
+        text = f"{plate['text']} ({plate['score']:.2f})"
+        img = draw_license_plate_text(img, text, plate['position'])
+        licenses_texts.append(text)
+        license_plate_crops.append(license_plate_crop)
 
-            # Распознавание текста номера
-            license_plate_text, license_plate_text_score = read_license_plate(license_plate_crop_gray)
+    # Находим номер с максимальным score в текущем кадре
+    current_best = max(plates_to_draw, key=lambda x: x['score'], default=None)
 
-            if license_plate_text:
-                licenses_texts.append(license_plate_text)
-                license_plate_crops.append(license_plate_crop)
-
-                # Отрисовка текста номера
-                img = draw_license_plate_text(img, license_plate_text, (int(x1), int(y1) - 40))
-
-    # Конвертируем обратно в RGB для отображения
     img_wth_box = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-    if licenses_texts:
-        return [img_wth_box, licenses_texts, license_plate_crops]
-    elif len(license_detections.boxes.cls.tolist()) > 0:
-        # Если были обнаружены области номеров, но текст не распознан или не соответствует формату
-        return [img_wth_box, ["Распознанный текст не соответствует формату номера"]]
+    if plates_to_draw:
+        return [img_wth_box, licenses_texts, license_plate_crops,
+                current_best['text'], current_best['score'], direction]
+    elif license_detections.boxes.cls.tolist():
+        return [img_wth_box, ["Номера обнаружены, но score < 0.85"], None, None, 0, direction]
     else:
-        # Если не обнаружено ни одной области номера
-        return [img_wth_box, ["Номера не обнаружены"]]
+        return [img_wth_box, ["Номера не обнаружены"], None, None, 0, direction]
 
+
+def draw_best_result(image, best_text, best_score, position):
+    """Рисует лучший результат всегда, если он есть (независимо от score)"""
+    if best_text is None or best_score is None:
+        return image
+
+    try:
+        # Создаем PIL изображение из OpenCV изображения
+        pil_image = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+        draw = ImageDraw.Draw(pil_image)
+
+        font = ImageFont.truetype("DejaVuSans.ttf", 30)
+        text = f"{best_text} ({best_score:.2f})"
+
+        text_bbox = draw.textbbox((0, 0), text, font=font)
+        text_width = text_bbox[2] - text_bbox[0]
+        text_height = text_bbox[3] - text_bbox[1]
+
+        x1, y1 = position
+        x2 = x1 + text_width + 20
+        y2 = y1 + text_height + 10
+
+        # Белый фон с чёрным текстом
+        draw.rectangle([(x1, y1), (x2, y2)], fill=(255, 255, 255))
+        draw.text((x1 + 10, y1 + 5), text, font=font, fill=(0, 0, 0))
+
+        return cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
+
+    except Exception as e:
+        logging.error(f"Error drawing best result: {e}")
+        return image
 
 def draw_license_plate_text(image, text, position):
     """Рисует текст номерного знака с белым фоном и черным текстом"""
@@ -126,11 +169,20 @@ def draw_license_plate_text(image, text, position):
         logging.error(f"Error drawing license plate text: {e}")
         return image
 
+
 def license_complies_format(text):
-    """Check if the license plate text complies with the required format."""
+    """Проверка формата номера (Российский стандарт)"""
+    # car
     if len(text) == 9 and text[0].isalpha() and text[1:4].isdigit() and text[4:6].isalpha() and text[6:].isdigit():
         return True
+    # car
     elif len(text) == 8 and text[0].isalpha() and text[1:4].isdigit() and text[4:6].isalpha() and text[6:].isdigit():
+        return True
+    # trailer
+    elif len(text) == 8 and text[0:2].isalpha() and text[2:6].isdigit() and text[6:].isdigit():
+        return True
+    # trailer
+    elif len(text) == 9 and text[0:2].isalpha() and text[2:6].isdigit() and text[6:].isdigit():
         return True
     return False
 
@@ -149,48 +201,95 @@ def format_license(text):
 
 
 def read_license_plate(license_plate_crop):
-    """Read the license plate text from a cropped image."""
-    detections = reader.readtext(license_plate_crop)
-    for detection in detections:
-        bbox, text, score = detection
-        text = text.upper().replace(' ', '')
+    """Read the license plate text from a cropped image with enhanced preprocessing."""
+    try:
+        # Предварительная обработка изображения
+        processed_img = preprocess_image(license_plate_crop)
 
-        # Если текст слишком короткий, пропускаем
-        if len(text) < 3:
-            continue
+        # cv2.resize(processed_img, (200, 50))
 
-        if license_complies_format(text):
+        # Параметры для улучшения распознавания
+        decoder = 'greedy'  # Можно попробовать 'beamsearch'
+        beamWidth = 5  # Для beamsearch
+        batch_size = 1
+
+        detections = reader.readtext(
+            processed_img,
+            decoder=decoder,
+            beamWidth=beamWidth,
+            batch_size=batch_size,
+            detail=1,
+            paragraph=False,
+            min_size=20,
+            text_threshold=0.7,
+            low_text=0.4,
+            link_threshold=0.4,
+            canvas_size=2560,
+            mag_ratio=1.5
+        )
+
+        best_text = None
+        best_score = 0
+
+        for detection in detections:
+            bbox, text, score = detection
+            text = text.upper().replace(' ', '').replace('-', '')
+
+            # Удаляем лишние символы
+            text = ''.join(c for c in text if c.isalnum())
+
+            if len(text) < 3:
+                continue
+
+            # Проверяем формат номера
             formatted_text = format_license(text)
             formatted_text = post_process_license(formatted_text)
-            return formatted_text, score
+
+            # Сохраняем результат с наивысшим score
+            if score > best_score:
+                best_text = formatted_text
+                best_score = score
+
+        if best_text:
+            if license_complies_format(best_text):
+                logging.info(f"Valid plate: {best_text}, score: {best_score:.2f}")
+                return best_text, float(best_score)  # Явно преобразуем в float
+            else:
+                logging.info(f"Invalid format: {best_text}, score: {best_score:.2f}")
         else:
-            # Возвращаем текст, даже если он не соответствует формату
-            formatted_text = format_license(text)
-            formatted_text = post_process_license(formatted_text)
-            return f"Неизвестный формат: {formatted_text}", score
+            logging.info("No plate found")
 
-    return None, None
+        return None, 0.0  # Всегда возвращаем кортеж (None, 0.0) если номер не найден
+
+    except Exception as e:
+        logging.error(f"Error in read_license_plate: {e}")
+        return None, 0.0
+
+
+def preprocess_image(img):
+    """Улучшенная предобработка изображения"""
+    try:
+        return img
+    except Exception as e:
+        logging.error(f"Error in preprocess_image: {e}")
+        return img
 
 
 def post_process_license(text):
-    """Post-process the recognized license plate text."""
+    """Исправление частых ошибок распознавания"""
     corrections = {
-        '0': 'О', 'О': '0', 'о': '0',
-        'A': 'А', 'a': 'а', 'B': 'В', 'b': 'в',
-        'E': 'Е', 'e': 'е', 'K': 'К', 'k': 'к',
-        'M': 'М', 'm': 'м', 'H': 'Н', 'h': 'н',
-        'P': 'Р', 'p': 'р', 'C': 'С', 'c': 'с',
-        'T': 'Т', 't': 'т', 'Y': 'У', 'y': 'у',
-        'X': 'Х', 'x': 'х'
+        'И': 'Н', 'П': 'Н', 'Л': 'Е', 'Ц': '7',
+        'Ч': '9', 'Я': '9', 'З': '3', 'Ш': 'Н',
+        'Ъ': 'Ь', 'Ы': 'М', 'В': 'В', 'Д': '0',
+        ' ': '', '-': '', '_': ''
     }
 
-    for char in corrections:
-        text = text.replace(char, corrections[char])
+    # Применяем замену символов
+    corrected_text = []
+    for char in text.upper():
+        corrected_text.append(corrections.get(char, char))
 
-    if len(text) == 9 and text[4] == '0':
-        text = text[:4] + 'О' + text[5:]
-
-    return text
+    return ''.join(corrected_text)
 
 
 def get_car(license_plate, vehicle_track_ids):

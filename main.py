@@ -13,7 +13,7 @@ def main():
     try:
         # Load models
         coco_model = YOLO('yolov8n.pt')
-        license_plate_detector = YOLO('license_plate_detector.pt')
+        license_plate_detector = YOLO('LicensePlateReader.pt')
         logging.info("Models loaded successfully.")
     except Exception as e:
         logging.error(f"Error loading models: {e}")
