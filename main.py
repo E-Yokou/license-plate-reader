@@ -1,5 +1,7 @@
 import sys
 import logging
+
+import torch
 from PyQt5.QtWidgets import QApplication
 from sort.sort import Sort
 from ultralytics import YOLO
@@ -12,8 +14,8 @@ logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %
 def main():
     try:
         # Load models
-        coco_model = YOLO('yolov8n.pt')
-        license_plate_detector = YOLO('LicensePlateReader.pt')
+        coco_model = YOLO('yolov8n.pt').to('cuda' if torch.cuda.is_available() else 'cpu')
+        license_plate_detector = YOLO('LicensePlateReader.pt').to('cuda' if torch.cuda.is_available() else 'cpu')
         logging.info("Models loaded successfully.")
     except Exception as e:
         logging.error(f"Error loading models: {e}")

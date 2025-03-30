@@ -59,6 +59,7 @@ def model_prediction(img, coco_model, license_plate_detector, ocr_reader):
             cv2.rectangle(img, (int(xcar1), int(ycar1)), (int(xcar2), int(ycar2)), (255, 0, 0), 3)
 
     # Определяем направление
+    direction = ""
     if {6, 72}.intersection(vehicle_classes):
         direction = "backward"
     elif {7}.intersection(vehicle_classes):  # Если есть транспортное средство
@@ -311,18 +312,25 @@ def get_car(license_plate, vehicle_track_ids):
 
 def insert_car_data(license_plate_text, photo, car_type, date):
     """Insert car data into the database."""
+    conn = None
     try:
         conn = mysql.connector.connect(**db_config)
+        logging.info("Успешное подключение к MySQL")
+
         cursor = conn.cursor()
         insert_query = """
         INSERT INTO car (photo, car_type, car_number, date)
         VALUES (%s, %s, %s, %s)
         """
+
         cursor.execute(insert_query, (photo, car_type, license_plate_text, date))
         conn.commit()
+        logging.info(f"Данные сохранены в БД: {license_plate_text}")
+
     except mysql.connector.Error as err:
-        logging.error(f"Error inserting data into database: {err}")
+        logging.error(f"Ошибка MySQL: {err}")
+
     finally:
-        if conn.is_connected():
+        if conn and conn.is_connected():
             cursor.close()
             conn.close()

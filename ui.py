@@ -6,6 +6,7 @@ from datetime import datetime
 import threading
 import time
 import numpy as np
+import torch
 from PyQt5.QtWidgets import (
     QWidget, QLabel, QSizePolicy, QTextEdit, QPushButton, QVBoxLayout, QApplication,
     QMenuBar, QMenu, QAction, QInputDialog, QLineEdit, QCheckBox, QDialog,
@@ -834,11 +835,23 @@ class VideoApp(QWidget):
             if not ret or frame is None:
                 return
 
-            # frame = cv2.resize(frame, (1920, 1080))
+            # Детекция транспортных средств (из старой версии)
+            detections = self.coco_model(frame)[0]
+            detections_ = []
+            car_detections = {}
+            for detection in detections.boxes.data.tolist():
+                x1, y1, x2, y2, score, class_id = detection
+                if int(class_id) in self.vehicles:
+                    detections_.append([x1, y1, x2, y2, score])
+                    car_detections[(x1, y1, x2, y2)] = int(class_id)
+
+            # Трекинг (из старой версии)
+            track_ids = self.mot_tracker.update(np.asarray(detections_)) if detections_ else []
+
+            # Обработка номеров (новая версия)
             results = model_prediction(frame, self.coco_model, self.license_plate_detector, reader)
 
-            # Обработка всех обнаруженных номеров
-            if len(results) >= 6:  # Теперь возвращается 6 значений
+            if len(results) >= 6:
                 processed_frame, texts, crops, current_best_text, current_best_score, direction = results
 
                 # Обновляем лучший результат
@@ -849,31 +862,47 @@ class VideoApp(QWidget):
                     logging.info(
                         f"Новый лучший результат: {self.best_text} ({self.best_score:.2f}), направление: {direction}")
 
-                # Новая логика вывода номеров
-                if current_best_score > 0.85:
-                    if self.last_recognized_plate != current_best_text:
-                        display_text = f"{current_best_text} ({current_best_score:.2f})"
-                        if direction:
-                            display_text += f" {direction}"
-                        self.plate_text_display.append(display_text)
-                        self.last_recognized_plate = current_best_text
-                        self.last_recognized_score = current_best_score
+                # Новая логика вывода номеров с сохранением в БД
+                if current_best_score > 0.85 and current_best_text != self.last_recognized_plate:
+                    self.last_recognized_plate = current_best_text
+                    self.last_recognized_score = current_best_score
 
+                    # Определяем тип авто (из старой версии)
+                    car_type = None
+                    for license_plate in self.license_plate_detector(frame)[0].boxes.data.tolist():
+                        x1, y1, x2, y2, score, class_id = license_plate
+                        xcar1, ycar1, xcar2, ycar2, car_id = self.get_car(license_plate, track_ids)
+                        if car_id != -1:
+                            car_key = (xcar1, ycar1, xcar2, ycar2)
+                            if car_key in car_detections:
+                                car_type = "Car" if car_detections[car_key] == 2 else "Truck"
+                                break
+
+                    if not car_type:
+                        car_type = "Car"  # значение по умолчанию
+
+                    # Сохранение в БД (из старой версии)
+                    try:
                         _, buffer = cv2.imencode('.jpg', processed_frame)
                         if buffer is not None:
                             photo_bytes = buffer.tobytes()
                             current_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                            car_type = "Car"  # Можно определить более точно из результатов детекции
                             self.insert_car_data(
-                                self.last_recognized_plate,
+                                current_best_text,
                                 photo_bytes,
                                 car_type,
                                 current_date
                             )
+                    except Exception as e:
+                        logging.error(f"Ошибка при сохранении в БД: {e}")
 
-                        logging.info(f"Отображен новый номер: {current_best_text}, направление: {direction}")
+                    # Отображение информации
+                    display_text = f"{current_best_text} ({current_best_score:.2f})"
+                    if direction:
+                        display_text += f" {direction}"
+                    self.plate_text_display.append(display_text)
 
-            # Отображение FPS
+            # Отображение FPS (из новой версии)
             if self.show_fps:
                 current_fps = self.calculate_fps(start_time)
                 processed_frame = draw_license_plate_text(
@@ -900,8 +929,17 @@ class VideoApp(QWidget):
             if self.is_streaming:
                 self.send_frame_to_stream(processed_frame)
 
+        except RuntimeError as e:
+            if "CUDA out of memory" in str(e):
+                logging.error("CUDA memory error - trying to recover")
+                torch.cuda.empty_cache()
+                self.restart_video_streams()
+            else:
+                logging.error(f"Runtime error: {e}")
         except Exception as e:
-            logging.error(f"Error in update_frame: {e}")
+            logging.error(f"Unexpected error in update_frame: {e}")
+            self.release_cameras()
+            self.timer.stop()
 
     # def update_frame(self):
     #     try:
