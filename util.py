@@ -310,26 +310,31 @@ def get_car(license_plate, vehicle_track_ids):
     return -1, -1, -1, -1, -1
 
 
-def insert_car_data(license_plate_text, photo, car_type, date):
+def insert_car_data(license_plate_text, photo, car_type, date, camera_id):
     """Insert car data into the database."""
     conn = None
     try:
         conn = mysql.connector.connect(**db_config)
-        logging.info("Успешное подключение к MySQL")
-
         cursor = conn.cursor()
+
+        # First, get the camera ID if camera name was provided
+        if camera_id and not str(camera_id).isdigit():
+            # Query the database to get camera ID by name
+            cursor.execute("SELECT id FROM camera WHERE name = %s", (camera_id,))
+            result = cursor.fetchone()
+            if result:
+                camera_id = result[0]
+            else:
+                camera_id = None  # or set a default value
+
         insert_query = """
-        INSERT INTO car (photo, car_type, car_number, date)
-        VALUES (%s, %s, %s, %s)
+        INSERT INTO car (photo, car_type, car_number, date, camera_id)
+        VALUES (%s, %s, %s, %s, %s)
         """
-
-        cursor.execute(insert_query, (photo, car_type, license_plate_text, date))
+        cursor.execute(insert_query, (photo, car_type, license_plate_text, date, camera_id))
         conn.commit()
-        logging.info(f"Данные сохранены в БД: {license_plate_text}")
-
     except mysql.connector.Error as err:
         logging.error(f"Ошибка MySQL: {err}")
-
     finally:
         if conn and conn.is_connected():
             cursor.close()
