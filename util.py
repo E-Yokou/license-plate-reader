@@ -1,4 +1,4 @@
-import time
+# file util.py
 
 import easyocr
 import logging
@@ -136,15 +136,18 @@ def draw_best_result(image, best_text, best_score, position):
         logging.error(f"Error drawing best result: {e}")
         return image
 
-def draw_license_plate_text(image, text, position):
-    """Рисует текст номерного знака с белым фоном и черным текстом"""
+def draw_license_plate_text(image, text, position, font_size=30, bg_color=(255, 255, 255), text_color=(0, 0, 0)):
+    """Рисует текст номерного знака с фоном"""
     try:
         # Создаем PIL изображение из OpenCV изображения
         pil_image = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
         draw = ImageDraw.Draw(pil_image)
 
-        # Загружаем шрифт DejaVuSans.ttf
-        font = ImageFont.truetype("DejaVuSans.ttf", 30)
+        # Загружаем шрифт
+        try:
+            font = ImageFont.truetype("DejaVuSans.ttf", font_size)
+        except:
+            font = ImageFont.load_default()
 
         # Рассчитываем размеры текста
         text_bbox = draw.textbbox((0, 0), text, font=font)
@@ -153,16 +156,16 @@ def draw_license_plate_text(image, text, position):
 
         # Координаты для прямоугольника фона
         x1, y1 = position
-        x2 = x1 + text_width + 80
-        y2 = y1 + text_height + 20
+        x2 = x1 + text_width + 20
+        y2 = y1 + text_height + 10
 
-        # Рисуем белый прямоугольник фона
-        draw.rectangle([(x1, y1), (x2, y2)], fill=(255, 255, 255))
+        # Рисуем прямоугольник фона
+        draw.rectangle([(x1, y1), (x2, y2)], fill=bg_color)
 
-        # Рисуем черный текст
-        text_x = x1 + 40
-        text_y = y1 + 10
-        draw.text((text_x, text_y), text, font=font, fill=(0, 0, 0))
+        # Рисуем текст
+        text_x = x1 + 10
+        text_y = y1 + 5
+        draw.text((text_x, text_y), text, font=font, fill=text_color)
 
         # Конвертируем обратно в OpenCV формат
         return cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)

@@ -1,4 +1,3 @@
-# ui.py
 import base64
 import logging
 import queue
@@ -28,7 +27,6 @@ import os
 from util import draw_license_plate_text
 
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
-
 
 def get_available_usb_cameras(max_to_check=5):
     available_cameras = []
@@ -112,7 +110,6 @@ class StatusIndicator(QLabel):
         if self.status == "disconnected":
             painter.setPen(QPen(Qt.black, 1))
             painter.drawText(self.rect(), Qt.AlignCenter, "!")
-
 
 class CameraManagementDialog(QDialog):
     def __init__(self, parent=None):
@@ -348,7 +345,6 @@ class ServerSettingsDialog(QDialog):
     def get_settings(self):
         return self.ip_input.text(), self.port_input.text()
 
-
 class CameraSettingsDialog(QDialog):
     def __init__(self, camera_urls, usb_enabled, usb_camera_index, parent=None):
         super().__init__(parent)
@@ -416,7 +412,6 @@ class CameraSettingsDialog(QDialog):
         usb_camera_index = self.usb_camera_index_combo.currentData()
         return [camera1_url, camera2_url], usb_enabled, usb_camera_index
 
-
 class VideoApp(QWidget):
     connection_status_changed = pyqtSignal(str)
     camera_connected_changed = pyqtSignal(bool)
@@ -437,6 +432,8 @@ class VideoApp(QWidget):
         self.best_text = None
         self.best_score = 0.0
         self.last_direction = None
+        self.last_recognized = {}
+        self.display_duration = 5
 
         self.last_recognized_plate = None
         self.last_recognized_score = 0.0
@@ -485,7 +482,6 @@ class VideoApp(QWidget):
         # Connect signals
         self.connection_status_changed.connect(self.update_connection_status)
         self.camera_connected_changed.connect(self.update_camera_button_status)
-
 
     def init_ui(self):
         self.setWindowTitle("Vehicle & License Plate Recognition")
@@ -988,8 +984,6 @@ class VideoApp(QWidget):
         self.last_recognized_plate = None
         self.last_recognized_score = 0.0
 
-
-
     def release_cameras(self):
         try:
             for cap, _ in self.video_labels:
@@ -1241,13 +1235,20 @@ class VideoApp(QWidget):
             if not self.video_labels:
                 return
 
+            current_time = time.time()
+
             for idx, (cap, video_label) in enumerate(self.video_labels):
                 start_time = time.time()
                 ret, frame = cap.read()
                 if not ret or frame is None:
                     continue
 
-                # Детекция транспортных средств (из старой версии)
+                # Get camera info
+                camera_id = self.camera_ids[idx]
+                camera_info = self.camera_info.get(camera_id, {})
+                camera_name = camera_info.get('name', f'Камера {idx + 1}')
+
+                # Process frame
                 detections = self.coco_model(frame)[0]
                 detections_ = []
                 car_detections = {}
@@ -1257,43 +1258,28 @@ class VideoApp(QWidget):
                         detections_.append([x1, y1, x2, y2, score])
                         car_detections[(x1, y1, x2, y2)] = int(class_id)
 
-                # Трекинг (из старой версии)
                 track_ids = self.mot_tracker.update(np.asarray(detections_)) if detections_ else []
-
-                # Обработка номеров (новая версия)
                 results = model_prediction(frame, self.coco_model, self.license_plate_detector, reader)
+
+                processed_frame = frame.copy()
+                current_best_text = None
+                current_best_score = 0
+                direction = None
 
                 if len(results) >= 6:
                     processed_frame, texts, crops, current_best_text, current_best_score, direction = results
 
-                    # Обновляем лучший результат
-                    if current_best_score > self.best_score:
-                        self.best_text = current_best_text
-                        self.best_score = current_best_score
-                        self.last_direction = direction
-                        logging.info(
-                            f"Новый лучший результат: {self.best_text} ({self.best_score:.2f}), направление: {direction}")
+                    # Если найден хороший номер, обновляем информацию
+                    if current_best_text and current_best_score > 0.85:
+                        self.last_recognized[camera_id] = {
+                            "text": current_best_text,
+                            "score": current_best_score,
+                            "time": current_time,
+                            "direction": direction
+                        }
 
-                    # Новая логика вывода номеров с сохранением в БД
-                    if current_best_score > 0.85 and current_best_text != self.last_recognized_plate:
-                        self.last_recognized_plate = current_best_text
-                        self.last_recognized_score = current_best_score
-
-                        # Определяем тип авто (из старой версии)
-                        car_type = None
-                        for license_plate in self.license_plate_detector(frame)[0].boxes.data.tolist():
-                            x1, y1, x2, y2, score, class_id = license_plate
-                            xcar1, ycar1, xcar2, ycar2, car_id = self.get_car(license_plate, track_ids)
-                            if car_id != -1:
-                                car_key = (xcar1, ycar1, xcar2, ycar2)
-                                if car_key in car_detections:
-                                    car_type = "Car" if car_detections[car_key] == 2 else "Truck"
-                                    break
-
-                        if not car_type:
-                            car_type = "Car"  # значение по умолчанию
-
-                        # Сохранение в БД (из старой версии)
+                        # Сохраняем в базу данных
+                        car_type = "Car"  # Можно улучшить определение типа
                         try:
                             _, buffer = cv2.imencode('.jpg', processed_frame)
                             if buffer is not None:
@@ -1304,56 +1290,51 @@ class VideoApp(QWidget):
                                     photo_bytes,
                                     car_type,
                                     current_date,
-                                    self.camera_names[idx] if hasattr(self, 'camera_names') and idx < len(
-                                        self.camera_names) else None
+                                    camera_id
                                 )
                         except Exception as e:
                             logging.error(f"Ошибка при сохранении в БД: {e}")
 
-                        # Отображение информации
-                        if hasattr(self, 'plate_text_display'):
-                            display_text = f"{current_best_text} ({current_best_score:.2f})"
-                            if direction:
-                                display_text += f" {direction}"
-                            self.plate_text_display.append(display_text)
-
-                # Отображение FPS (из новой версии)
+                # Display FPS (на всех камерах)
                 if self.show_fps:
                     current_fps = self.calculate_fps(start_time)
                     processed_frame = draw_license_plate_text(
                         processed_frame,
                         f"FPS: {current_fps:.2f}",
-                        (10, 10)
+                        (10, 10),
+                        font_size=20
                     )
 
-                # Добавление названия камеры в верхнем правом углу
-                camera_name = self.camera_names[idx]
+                # Display camera name (на всех камерах)
                 processed_frame = draw_license_plate_text(
                     processed_frame,
                     camera_name,
-                    (frame.shape[2] - 400, 10),  # Координаты для верхнего правого угла
+                    (10, frame.shape[0] - 40),  # Нижний левый угол
+                    font_size=20,
+                    bg_color=(0, 0, 255),  # Синий фон
+                    text_color=(255, 255, 255)  # Белый текст
                 )
 
-                # Всегда отображаем лучший результат, если он есть
-                if self.last_recognized_plate and self.last_recognized_score > 0.85:
-                    display_text = f"{self.last_recognized_plate} ({self.last_recognized_score:.2f})"
-                    if self.last_direction:
-                        display_text += f" {self.last_direction}"
+                # Отображаем последний распознанный номер, если он еще актуален
+                last_rec = self.last_recognized.get(camera_id)
+                if last_rec and (current_time - last_rec["time"] < self.display_duration):
+                    display_text = f"{last_rec['text']} ({last_rec['score']:.2f})"
+                    if last_rec["direction"]:
+                        display_text += f" ({last_rec['direction']})"
 
-                    processed_frame = draw_best_result(
+                    processed_frame = draw_license_plate_text(
                         processed_frame,
                         display_text,
-                        self.last_recognized_score,
-                        (350, 10)
+                        (frame.shape[1] - 400, 10),  # Верхний правый угол
+                        font_size=24,
+                        bg_color=(0, 255, 0),  # Зеленый фон
+                        text_color=(0, 0, 0)  # Черный текст
                     )
 
                 self.display_processed_frame(processed_frame, video_label)
 
                 if self.is_streaming:
-                    # Получаем camera_id для текущего потока
-                    if idx < len(self.camera_ids):
-                        camera_id = self.camera_ids[idx]
-                        self.send_frame_to_stream(processed_frame, idx) # idx - это идентификатор камеры
+                    self.send_frame_to_stream(processed_frame, idx)
 
         except RuntimeError as e:
             if "CUDA out of memory" in str(e):
@@ -1383,93 +1364,6 @@ class VideoApp(QWidget):
                 )
         except Exception as e:
             logging.error(f"Ошибка при сохранении в БД: {e}")
-
-    # def update_frame(self):
-    #     try:
-    #         if not any([self.cap1, self.cap2, self.video_cap, hasattr(self, 'usb_cap')]):
-    #             return
-    #
-    #         start_time = time.time()
-    #         ret, frame = self.get_current_frame()
-    #         if not ret or frame is None:
-    #             return
-    #
-    #         frame = cv2.resize(frame, (1920, 1080))
-    #         results = model_prediction(frame, self.coco_model, self.license_plate_detector, reader)
-    #
-    #         # Обработка всех обнаруженных номеров
-    #         if len(results) >= 6:  # Теперь возвращается 6 значений
-    #             processed_frame, texts, crops, current_best_text, current_best_score, direction = results
-    #
-    #             # Обновляем лучший результат
-    #             if current_best_score > getattr(self, 'best_score', 0):
-    #                 self.best_text = current_best_text
-    #                 self.best_score = current_best_score
-    #                 self.last_direction = direction  # Сохраняем направление
-    #                 logging.info(
-    #                     f"Новый лучший результат: {self.best_text} ({self.best_score:.2f}), направление: {direction}")
-    #
-    #             # Новая логика вывода номеров
-    #             if current_best_score > 0.85:
-    #                 if self.last_recognized_plate != current_best_text:
-    #                     # Это новый номер, отличающийся от предыдущего
-    #                     display_text = f"{current_best_text} ({current_best_score:.2f})"
-    #                     if direction:
-    #                         display_text += f" ({direction})"
-    #                     self.plate_text_display.append(display_text)
-    #                     self.last_recognized_plate = current_best_text
-    #                     self.last_recognized_score = current_best_score
-    #                     logging.info(f"Отображен новый номер: {current_best_text}, направление: {direction}")
-    #
-    #         # Отображение FPS
-    #         if self.show_fps:
-    #             current_fps = self.calculate_fps(start_time)
-    #             processed_frame = draw_license_plate_text(
-    #                 processed_frame,
-    #                 f"FPS: {current_fps:.2f}",
-    #                 (10, 10)
-    #             )
-    #
-    #         # Отображение лучшего результата с направлением
-    #         if hasattr(self, 'best_text') and hasattr(self, 'best_score'):
-    #             if self.best_score > 0.85:
-    #                 display_text = f"{self.best_text} ({self.best_score:.2f})"
-    #                 if hasattr(self, 'last_direction') and self.last_direction:
-    #                     display_text += f" {self.last_direction}"
-    #
-    #                 processed_frame = draw_best_result(
-    #                     processed_frame,
-    #                     display_text,
-    #                     self.best_score,
-    #                     (10, 350)
-    #                 )
-    #
-    #         self.display_processed_frame(processed_frame)
-    #
-    #         if self.is_streaming:
-    #             self.send_frame_to_stream(processed_frame)
-    #
-    #     except Exception as e:
-    #         logging.error(f"Error in update_frame: {e}")
-
-    def get_current_frame(self):
-        """Получает текущий кадр из активного источника"""
-        if self.current_camera == "Камера 1" and self.cap1 and self.cap1.isOpened():
-            return self.cap1.read()
-        elif self.current_camera == "Камера 2" and self.cap2 and self.cap2.isOpened():
-            return self.cap2.read()
-        elif self.current_camera == "USB Камера" and hasattr(self, 'usb_cap') and self.usb_cap.isOpened():
-            return self.usb_cap.read()
-        elif self.current_camera == "Видеофайл" and self.video_cap and self.video_cap.isOpened():
-            return self.video_cap.read()
-        return False, None
-
-    def process_recognized_texts(self, texts):
-        """Обрабатывает распознанные тексты номеров"""
-        for text in texts:
-            if text and text not in self.recognized_plates:
-                self.recognized_plates.add(text)
-                self.plate_text_display.append(text)
 
     def calculate_fps(self, start_time):
         """Вычисляет текущий FPS"""
