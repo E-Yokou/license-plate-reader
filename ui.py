@@ -452,6 +452,9 @@ class VideoApp(QWidget):
         self.video_file = ""
         self.current_camera_url = None
 
+        self.camera_info = {}  # {camera_id: {'ip': str, 'name': str}}
+        self.current_camera_id = None  # Текущий активный camera_id
+
         # Initialize UI
         self.init_ui()
 
@@ -612,12 +615,12 @@ class VideoApp(QWidget):
             logging.info("Connecting to selected cameras")
             self.release_cameras()
             self.video_labels.clear()
-            self.camera_names.clear()  # Очищаем список названий камер
+            self.camera_ids = []
+            self.camera_info.clear()  # Очищаем информацию о камерах
 
-            # Получаем названия камер из базы данных
             conn = mysql.connector.connect(**db_config)
             cursor = conn.cursor(dictionary=True)
-            cursor.execute("SELECT ip_address, name FROM camera WHERE ip_address IN (%s)" % ','.join(
+            cursor.execute("SELECT id, ip_address, name FROM camera WHERE ip_address IN (%s)" % ','.join(
                 ['%s'] * len(selected_cameras)), selected_cameras)
             cameras = cursor.fetchall()
             cursor.close()
@@ -633,9 +636,15 @@ class VideoApp(QWidget):
                 video_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
                 video_label.setAlignment(Qt.AlignCenter)
                 self.video_labels.append((cap, video_label))
-                self.video_layout.addWidget(video_label, row // 2, row % 2)
+                self.camera_ids.append(camera['id'])
 
-                # Добавляем название камеры в список
+                # Сохраняем информацию о камере
+                self.camera_info[camera['id']] = {
+                    'ip': camera['ip_address'],
+                    'name': camera['name']
+                }
+
+                self.video_layout.addWidget(video_label, row // 2, row % 2)
                 self.camera_names.append(camera['name'])
 
             self.timer.start(1000 // self.fps_limit)
@@ -1109,30 +1118,54 @@ class VideoApp(QWidget):
             if self.connection_status == "connected":
                 self.connection_status_changed.emit("disconnected")
 
-    def send_frame(self, frame):
+    def send_frame(self, frame, camera_id):
         try:
             if not self.server_ip or not self.server_port:
                 logging.error("Server IP or port not set")
-                return
+                return False
 
+            # Получаем информацию о камере
+            camera_data = self.camera_info.get(camera_id)
+            if not camera_data:
+                logging.error(f"No camera info for id: {camera_id}")
+                return False
+
+            # Подготовка кадра
             small_frame = cv2.resize(frame, (1280, 720))
             encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 70]
             _, buffer = cv2.imencode('.jpg', small_frame, encode_param)
             jpg_as_text = base64.b64encode(buffer).decode('utf-8')
+
+            # Формируем данные для отправки
+            payload = {
+                "camera_id": str(camera_id),
+                "camera_ip": camera_data['ip'],
+                "frame": jpg_as_text
+            }
+
+            logging.debug(f"Sending frame from camera {camera_id} ({camera_data['name']})")
+
             response = requests.post(
                 f"http://{self.server_ip}:{self.server_port}/upload",
-                json={"frame": jpg_as_text},
-                timeout=0.5
+                json=payload,
+                timeout=1.0  # Увеличиваем таймаут
             )
+
             if response.status_code != 200:
                 logging.error(f"Server error: {response.status_code} - {response.text}")
                 self.connection_status_changed.emit("disconnected")
+                return False
+
+            return True
+
         except requests.exceptions.RequestException as e:
             logging.error(f"Network error: {e}")
             self.connection_status_changed.emit("disconnected")
+            return False
         except Exception as e:
             logging.error(f"Error in send_frame: {e}")
             self.connection_status_changed.emit("disconnected")
+            return False
 
     def set_fps_limit(self):
         try:
@@ -1317,7 +1350,10 @@ class VideoApp(QWidget):
                 self.display_processed_frame(processed_frame, video_label)
 
                 if self.is_streaming:
-                    self.send_frame_to_stream(processed_frame)
+                    # Получаем camera_id для текущего потока
+                    if idx < len(self.camera_ids):
+                        camera_id = self.camera_ids[idx]
+                        self.send_frame_to_stream(processed_frame, idx) # idx - это идентификатор камеры
 
         except RuntimeError as e:
             if "CUDA out of memory" in str(e):
@@ -1451,22 +1487,28 @@ class VideoApp(QWidget):
         pixmap = pixmap.scaled(video_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
         video_label.setPixmap(pixmap)
 
-    def send_frame_to_stream(self, frame):
+    def send_frame_to_stream(self, frame, camera_id):
         """Отправляет кадр на сервер трансляции"""
         try:
-            self.frame_queue.put_nowait(frame.copy())
+            self.frame_queue.put_nowait((frame.copy(), camera_id))  # Теперь передаем кортеж (frame, camera_id)
         except queue.Full:
             pass
 
     def streaming_worker(self):
         while True:
             try:
-                frame = self.frame_queue.get()
+                frame, camera_idx = self.frame_queue.get()
                 if frame is None:
                     break
-                self.send_frame(frame)
+
+                # Получаем camera_id по индексу
+                if camera_idx < len(self.camera_ids):
+                    camera_id = self.camera_ids[camera_idx]
+                    self.send_frame(frame, camera_id)
+
             except Exception as e:
                 logging.error(f"Error in streaming worker: {e}")
+                time.sleep(1)  # Задержка при ошибках
 
     def closeEvent(self, event):
         try:
