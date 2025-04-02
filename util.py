@@ -59,6 +59,7 @@ def model_prediction(img, coco_model, license_plate_detector, ocr_reader):
             cv2.rectangle(img, (int(xcar1), int(ycar1)), (int(xcar2), int(ycar2)), (255, 0, 0), 3)
 
     # Определяем направление
+    direction = ""
     if {6, 72}.intersection(vehicle_classes):
         direction = "backward"
     elif {7}.intersection(vehicle_classes):  # Если есть транспортное средство
@@ -309,20 +310,32 @@ def get_car(license_plate, vehicle_track_ids):
     return -1, -1, -1, -1, -1
 
 
-def insert_car_data(license_plate_text, photo, car_type, date):
+def insert_car_data(license_plate_text, photo, car_type, date, camera_id):
     """Insert car data into the database."""
+    conn = None
     try:
         conn = mysql.connector.connect(**db_config)
         cursor = conn.cursor()
+
+        # First, get the camera ID if camera name was provided
+        if camera_id and not str(camera_id).isdigit():
+            # Query the database to get camera ID by name
+            cursor.execute("SELECT id FROM camera WHERE name = %s", (camera_id,))
+            result = cursor.fetchone()
+            if result:
+                camera_id = result[0]
+            else:
+                camera_id = None  # or set a default value
+
         insert_query = """
-        INSERT INTO car (photo, car_type, car_number, date)
-        VALUES (%s, %s, %s, %s)
+        INSERT INTO car (photo, car_type, car_number, date, camera_id)
+        VALUES (%s, %s, %s, %s, %s)
         """
-        cursor.execute(insert_query, (photo, car_type, license_plate_text, date))
+        cursor.execute(insert_query, (photo, car_type, license_plate_text, date, camera_id))
         conn.commit()
     except mysql.connector.Error as err:
-        logging.error(f"Error inserting data into database: {err}")
+        logging.error(f"Ошибка MySQL: {err}")
     finally:
-        if conn.is_connected():
+        if conn and conn.is_connected():
             cursor.close()
             conn.close()

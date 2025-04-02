@@ -5,18 +5,22 @@ import queue
 from datetime import datetime
 import threading
 import time
+
+import mysql
 import numpy as np
+import torch
 from PyQt5.QtWidgets import (
     QWidget, QLabel, QSizePolicy, QTextEdit, QPushButton, QVBoxLayout, QApplication,
     QMenuBar, QMenu, QAction, QInputDialog, QLineEdit, QCheckBox, QDialog,
-    QFormLayout, QGroupBox, QHBoxLayout, QFileDialog, QMessageBox, QComboBox
+    QFormLayout, QGroupBox, QHBoxLayout, QFileDialog, QMessageBox, QComboBox, QTableWidgetItem, QDialogButtonBox,
+    QTableWidget, QListWidgetItem, QListWidget, QGridLayout
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QImage, QPixmap, QColor, QPainter, QPen
 from PIL import ImageFont, ImageDraw, Image
 import cv2
 import requests
-from util import model_prediction, reader, draw_best_result
+from util import model_prediction, reader, draw_best_result, db_config
 from queue import Queue
 import socket
 import os
@@ -24,7 +28,6 @@ import os
 from util import draw_license_plate_text
 
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
-
 
 def get_available_usb_cameras(max_to_check=5):
     available_cameras = []
@@ -34,6 +37,51 @@ def get_available_usb_cameras(max_to_check=5):
             available_cameras.append(i)
             cap.release()
     return available_cameras
+
+class CameraSelectionDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Выбор камер")
+        self.setMinimumSize(400, 300)
+
+        self.layout = QVBoxLayout()
+        self.setLayout(self.layout)
+
+        self.camera_list = QListWidget(self)
+        self.layout.addWidget(self.camera_list)
+
+        self.select_button = QPushButton("Выбрать", self)
+        self.select_button.clicked.connect(self.accept)
+        self.layout.addWidget(self.select_button)
+
+        self.load_cameras()
+
+    def load_cameras(self):
+        try:
+            conn = mysql.connector.connect(**db_config)
+            cursor = conn.cursor(dictionary=True)
+            cursor.execute("SELECT id, ip_address, name FROM camera")
+            cameras = cursor.fetchall()
+            cursor.close()
+            conn.close()
+
+            for camera in cameras:
+                item = QListWidgetItem(f"{camera['name']} ({camera['ip_address']})")
+                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                item.setCheckState(Qt.Unchecked)
+                item.setData(Qt.UserRole, camera['ip_address'])
+                self.camera_list.addItem(item)
+
+        except mysql.connector.Error as err:
+            QMessageBox.critical(self, "Ошибка", f"Ошибка при загрузке камер: {err}")
+
+    def get_selected_cameras(self):
+        selected_cameras = []
+        for index in range(self.camera_list.count()):
+            item = self.camera_list.item(index)
+            if item.checkState() == Qt.Checked:
+                selected_cameras.append(item.data(Qt.UserRole))
+        return selected_cameras
 
 class StatusIndicator(QLabel):
     def __init__(self, parent=None):
@@ -64,6 +112,172 @@ class StatusIndicator(QLabel):
             painter.setPen(QPen(Qt.black, 1))
             painter.drawText(self.rect(), Qt.AlignCenter, "!")
 
+
+class CameraManagementDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Управление камерами")
+        self.setMinimumSize(600, 400)
+
+        self.layout = QVBoxLayout()
+        self.setLayout(self.layout)
+
+        # Кнопка добавления новой камеры
+        self.add_button = QPushButton("Добавить новую камеру")
+        self.add_button.clicked.connect(self.add_camera)
+        self.layout.addWidget(self.add_button)
+
+        # Таблица с камерами
+        self.table = QTableWidget()
+        self.table.setColumnCount(4)
+        self.table.setHorizontalHeaderLabels(["ID", "IP адрес", "Название", "Действия"])
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.layout.addWidget(self.table)
+
+        # Кнопки управления
+        self.button_box = QDialogButtonBox(QDialogButtonBox.Close)
+        self.button_box.rejected.connect(self.reject)
+        self.layout.addWidget(self.button_box)
+
+        # Загружаем данные камер
+        self.load_cameras()
+
+    def load_cameras(self):
+        """Загружает список камер из базы данных"""
+        try:
+            # Подключаемся к базе данных
+            conn = mysql.connector.connect(**db_config)
+            cursor = conn.cursor(dictionary=True)
+
+            # Получаем все камеры
+            cursor.execute("SELECT id, ip_address, name FROM camera")
+            cameras = cursor.fetchall()
+
+            # Заполняем таблицу
+            self.table.setRowCount(len(cameras))
+            for row, camera in enumerate(cameras):
+                # ID
+                id_item = QTableWidgetItem(str(camera['id']))
+                id_item.setFlags(id_item.flags() ^ Qt.ItemIsEditable)
+                self.table.setItem(row, 0, id_item)
+
+                # IP адрес
+                ip_item = QTableWidgetItem(camera['ip_address'])
+                self.table.setItem(row, 1, ip_item)
+
+                # Название
+                name_item = QTableWidgetItem(camera['name'])
+                self.table.setItem(row, 2, name_item)
+
+                # Кнопки действий
+                button_widget = QWidget()
+                button_layout = QHBoxLayout()
+                button_layout.setContentsMargins(0, 0, 0, 0)
+
+                update_btn = QPushButton("Изменить")
+                update_btn.clicked.connect(lambda _, r=row: self.update_camera(r))
+                button_layout.addWidget(update_btn)
+
+                delete_btn = QPushButton("Удалить")
+                delete_btn.clicked.connect(lambda _, r=row: self.delete_camera(r))
+                button_layout.addWidget(delete_btn)
+
+                button_widget.setLayout(button_layout)
+                self.table.setCellWidget(row, 3, button_widget)
+
+            cursor.close()
+            conn.close()
+
+        except mysql.connector.Error as err:
+            QMessageBox.critical(self, "Ошибка", f"Ошибка при загрузке камер: {err}")
+
+    def add_camera(self):
+        """Добавляет новую камеру"""
+        try:
+            # Получаем данные из диалога
+            ip, ok = QInputDialog.getText(self, "Добавить камеру", "Введите IP адрес камеры:")
+            if not ok or not ip:
+                return
+
+            name, ok = QInputDialog.getText(self, "Добавить камеру", "Введите название камеры:")
+            if not ok:
+                return
+
+            # Сохраняем в базу данных
+            conn = mysql.connector.connect(**db_config)
+            cursor = conn.cursor()
+
+            cursor.execute(
+                "INSERT INTO camera (ip_address, name) VALUES (%s, %s)",
+                (ip, name)
+            )
+            conn.commit()
+
+            cursor.close()
+            conn.close()
+
+            # Обновляем таблицу
+            self.load_cameras()
+
+        except mysql.connector.Error as err:
+            QMessageBox.critical(self, "Ошибка", f"Ошибка при добавлении камеры: {err}")
+
+    def update_camera(self, row):
+        """Обновляет данные камеры"""
+        try:
+            # Получаем данные из таблицы
+            camera_id = int(self.table.item(row, 0).text())
+            ip_address = self.table.item(row, 1).text()
+            name = self.table.item(row, 2).text()
+
+            # Обновляем в базе данных
+            conn = mysql.connector.connect(**db_config)
+            cursor = conn.cursor()
+
+            cursor.execute(
+                "UPDATE camera SET ip_address = %s, name = %s WHERE id = %s",
+                (ip_address, name, camera_id)
+            )
+            conn.commit()
+
+            cursor.close()
+            conn.close()
+
+            QMessageBox.information(self, "Успех", "Данные камеры обновлены")
+
+        except mysql.connector.Error as err:
+            QMessageBox.critical(self, "Ошибка", f"Ошибка при обновлении камеры: {err}")
+
+    def delete_camera(self, row):
+        """Удаляет камеру"""
+        try:
+            camera_id = int(self.table.item(row, 0).text())
+
+            # Подтверждение удаления
+            reply = QMessageBox.question(
+                self, 'Подтверждение',
+                'Вы уверены, что хотите удалить эту камеру?',
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+            )
+
+            if reply == QMessageBox.No:
+                return
+
+            # Удаляем из базы данных
+            conn = mysql.connector.connect(**db_config)
+            cursor = conn.cursor()
+
+            cursor.execute("DELETE FROM camera WHERE id = %s", (camera_id,))
+            conn.commit()
+
+            cursor.close()
+            conn.close()
+
+            # Обновляем таблицу
+            self.load_cameras()
+
+        except mysql.connector.Error as err:
+            QMessageBox.critical(self, "Ошибка", f"Ошибка при удалении камеры: {err}")
 
 class ServerSettingsDialog(QDialog):
     def __init__(self, parent=None):
@@ -222,10 +436,8 @@ class VideoApp(QWidget):
         self.best_text = None
         self.best_score = 0.0
         self.last_direction = None
-
         self.last_recognized_plate = None
         self.last_recognized_score = 0.0
-
 
         # Server settings
         self.server_ip = "192.168.1.159"
@@ -236,6 +448,11 @@ class VideoApp(QWidget):
         self.camera_urls = ["http://192.168.1.106:4747/mjpegfeed?960x720", "http://192.168.1.120:4747/video?960x720"]
         self.usb_enabled = False
         self.video_file = ""
+        self.current_camera_url = None
+        self.camera_ids = []  # Список идентификаторов камер
+
+        self.camera_info = {}  # {camera_id: {'ip': str, 'name': str}}
+        self.current_camera_id = None  # Текущий активный camera_id
 
         # Initialize UI
         self.init_ui()
@@ -261,22 +478,21 @@ class VideoApp(QWidget):
         self.recognized_plates = set()
         self.frame_times = []
 
+        # Добавляем список для хранения названий камер
+        self.camera_names = []
+
         # Connect signals
         self.connection_status_changed.connect(self.update_connection_status)
         self.camera_connected_changed.connect(self.update_camera_button_status)
+
 
     def init_ui(self):
         self.setWindowTitle("Vehicle & License Plate Recognition")
         self.setGeometry(100, 100, 800, 600)
 
         # Create main widgets
-        self.video_label = QLabel("Нажмите 'Подключить' для запуска камеры", self)
-        self.video_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.video_label.setAlignment(Qt.AlignCenter)
-
-        self.plate_text_display = QTextEdit(self)
-        self.plate_text_display.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
-        self.plate_text_display.setReadOnly(True)
+        self.video_labels = []
+        self.video_layout = QGridLayout()
 
         # Create bottom panel with minimal buttons
         self.bottom_panel = QHBoxLayout()
@@ -287,12 +503,6 @@ class VideoApp(QWidget):
         self.pause_button.setEnabled(False)
         self.bottom_panel.addWidget(self.pause_button)
 
-        self.camera_switch_button = QPushButton("Переключить камеру", self)
-        self.camera_switch_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
-        self.camera_switch_button.clicked.connect(self.switch_camera)
-        self.camera_switch_button.setEnabled(False)
-        self.bottom_panel.addWidget(self.camera_switch_button)
-
         self.connect_button = QPushButton("Подключить", self)
         self.connect_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
         self.connect_button.clicked.connect(self.connect_cameras)
@@ -300,8 +510,7 @@ class VideoApp(QWidget):
 
         # Create main layout
         layout = QVBoxLayout()
-        layout.addWidget(self.video_label, 8)
-        layout.addWidget(self.plate_text_display, 2)
+        layout.addLayout(self.video_layout, 8)
         layout.addLayout(self.bottom_panel, 1)
         self.setLayout(layout)
 
@@ -335,9 +544,10 @@ class VideoApp(QWidget):
 
         # Camera menu
         self.camera_menu = QMenu("Камеры", self.menu_bar)
-        self.camera_settings_action = QAction("Настроить камеры", self)
-        self.camera_settings_action.triggered.connect(self.show_camera_settings)
-        self.camera_menu.addAction(self.camera_settings_action)
+
+        self.camera_management_action = QAction("Управление камерами", self)
+        self.camera_management_action.triggered.connect(self.show_camera_management)
+        self.camera_menu.addAction(self.camera_management_action)
 
         self.select_camera_action = QAction("Выбрать камеру", self)
         self.select_camera_action.triggered.connect(self.select_camera)
@@ -386,6 +596,73 @@ class VideoApp(QWidget):
         self.status_bar.addStretch()
 
         layout.addLayout(self.status_bar)
+
+    def show_camera_selection(self):
+        try:
+            logging.info("Opening camera selection dialog")
+            dialog = CameraSelectionDialog(self)
+            if dialog.exec_():
+                selected_cameras = dialog.get_selected_cameras()
+                logging.info(f"Selected cameras: {selected_cameras}")
+                self.connect_selected_cameras(selected_cameras)
+        except Exception as e:
+            logging.error(f"Error in camera selection dialog: {e}")
+            QMessageBox.critical(self, "Ошибка", f"Ошибка при выборе камер: {str(e)}")
+
+    def connect_selected_cameras(self, selected_cameras):
+        try:
+            logging.info("Connecting to selected cameras")
+            self.release_cameras()
+            self.video_labels.clear()
+            self.camera_ids = []
+            self.camera_info.clear()  # Очищаем информацию о камерах
+
+            conn = mysql.connector.connect(**db_config)
+            cursor = conn.cursor(dictionary=True)
+            cursor.execute("SELECT id, ip_address, name FROM camera WHERE ip_address IN (%s)" % ','.join(
+                ['%s'] * len(selected_cameras)), selected_cameras)
+            cameras = cursor.fetchall()
+            cursor.close()
+            conn.close()
+
+            for row, camera in enumerate(cameras):
+                cap = cv2.VideoCapture(camera['ip_address'])
+                if not cap.isOpened():
+                    logging.error(f"Error opening video stream for camera: {camera['ip_address']}")
+                    continue
+
+                video_label = QLabel(self)
+                video_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+                video_label.setAlignment(Qt.AlignCenter)
+                self.video_labels.append((cap, video_label))
+                self.camera_ids.append(camera['id'])
+
+                # Сохраняем информацию о камере
+                self.camera_info[camera['id']] = {
+                    'ip': camera['ip_address'],
+                    'name': camera['name']
+                }
+
+                self.video_layout.addWidget(video_label, row // 2, row % 2)
+                self.camera_names.append(camera['name'])
+
+            self.timer.start(1000 // self.fps_limit)
+            self.connect_button.setText("Отключить")
+            self.pause_button.setEnabled(True)
+            self.camera_connected_changed.emit(True)
+            logging.info("Cameras connected")
+        except Exception as e:
+            logging.error(f"Error connecting to selected cameras: {e}")
+            QMessageBox.critical(self, "Ошибка", f"Ошибка при подключении к выбранным камерам: {str(e)}")
+
+    def show_camera_settings(self):
+        try:
+            logging.info("Opening camera management dialog")
+            dialog = CameraManagementDialog(self)
+            dialog.exec_()
+        except Exception as e:
+            logging.error(f"Error in camera management dialog: {e}")
+            QMessageBox.critical(self, "Ошибка", f"Ошибка в управлении камерами: {str(e)}")
 
     def load_image_files(self):
         """Загрузка одного или нескольких изображений"""
@@ -555,31 +832,89 @@ class VideoApp(QWidget):
             logging.error(f"Error in camera settings dialog: {e}")
             QMessageBox.critical(self, "Ошибка", f"Ошибка в настройках камер: {str(e)}")
 
+    def get_cameras_from_db(self):
+        """Получает список камер из базы данных"""
+        try:
+            conn = mysql.connector.connect(**db_config)
+            cursor = conn.cursor(dictionary=True)
+
+            cursor.execute("SELECT id, ip_address, name FROM camera")
+            cameras = cursor.fetchall()
+
+            cursor.close()
+            conn.close()
+
+            return cameras
+
+        except mysql.connector.Error as err:
+            logging.error(f"Database error in get_cameras_from_db: {err}")
+            QMessageBox.critical(self, "Ошибка", f"Ошибка при загрузке камер из БД: {str(err)}")
+            return []
+
     def select_camera(self):
         try:
             logging.info("Selecting camera")
+
+            # Получаем список камер из базы данных
+            cameras = self.get_cameras_from_db()
+
+            # Собираем все доступные варианты камер
             items = []
+            camera_types = []
+
+            # Добавляем камеры из базы данных
+            for camera in cameras:
+                display_text = f"{camera['name']} ({camera['ip_address']})"
+                items.append(display_text)
+                camera_types.append(("db_camera", camera['ip_address']))
+
+            # Добавляем остальные камеры
             if self.camera_urls[0]:
-                items.append("Камера 1")
+                items.append("Камера 1 (Статическая)")
+                camera_types.append(("static_camera", 0))
             if self.camera_urls[1]:
-                items.append("Камера 2")
+                items.append("Камера 2 (Статическая)")
+                camera_types.append(("static_camera", 1))
             if self.usb_enabled:
                 items.append(f"USB Камера (индекс {self.usb_camera_index})")
-            if self.video_file:
+                camera_types.append(("usb_camera", self.usb_camera_index))
+            if hasattr(self, 'video_file') and self.video_file:
                 items.append("Видеофайл")
+                camera_types.append(("video_file", 0))
 
             if not items:
-                QMessageBox.warning(self, "Ошибка", "Нет доступных камер. Настройте камеры в меню 'Настроить камеры'")
+                QMessageBox.warning(self, "Ошибка",
+                                    "Нет доступных камер. Настройте камеры в меню 'Управление камерами'")
                 return
 
-            item, ok = QInputDialog.getItem(self, "Выбор камеры", "Выберите камеру:", items, 0, False)
+            item, ok = QInputDialog.getItem(
+                self,
+                "Выбор камеры",
+                "Выберите камеру:",
+                items,
+                0,
+                False
+            )
+
             if ok and item:
-                # Убираем уточнение про индекс для USB-камеры
-                if item.startswith("USB Камера"):
+                selected_index = items.index(item)
+                camera_type, camera_param = camera_types[selected_index]
+
+                if camera_type == "db_camera":
+                    self.current_camera = f"Камера из БД ({camera_param})"
+                    self.current_camera_url = camera_param
+                elif camera_type == "static_camera":
+                    self.current_camera = f"Камера {camera_param + 1}"
+                    self.current_camera_url = self.camera_urls[camera_param]
+                elif camera_type == "usb_camera":
                     self.current_camera = "USB Камера"
-                else:
-                    self.current_camera = item
+                    self.usb_camera_index = camera_param
+                elif camera_type == "video_file":
+                    self.current_camera = "Видеофайл"
+
                 logging.info(f"Selected camera: {self.current_camera}")
+                self.update_camera_buttons()
+
         except Exception as e:
             logging.error(f"Error in select camera: {e}")
             QMessageBox.critical(self, "Ошибка", f"Ошибка при выборе камеры: {str(e)}")
@@ -613,58 +948,149 @@ class VideoApp(QWidget):
     def connect_cameras(self):
         try:
             logging.info("Connecting/disconnecting cameras")
-            if not self.current_camera:
-                # self.select_camera()
-                return
-
             if self.timer.isActive():
                 # Disconnect cameras
                 self.timer.stop()
                 self.release_cameras()
-                self.video_label.setText("Камеры отключены")
                 self.connect_button.setText("Подключить")
                 self.pause_button.setEnabled(False)
-                self.camera_switch_button.setEnabled(False)
                 self.camera_connected_changed.emit(False)
+                self.clear_video_streams()
                 logging.info("Cameras disconnected")
             else:
-                # Connect cameras
-                if self.restart_video_streams():
-                    self.timer.start(1000 // self.fps_limit)
-                    self.connect_button.setText("Отключить")
-                    self.pause_button.setEnabled(True)
-                    self.camera_connected_changed.emit(True)
-                    logging.info("Cameras connected")
-                else:
-                    self.video_label.setText("Ошибка подключения к камере")
-                    QMessageBox.warning(self, "Ошибка", "Не удалось подключиться к камере")
+                try:
+                    # Попытка подключения к базе данных
+                    conn = mysql.connector.connect(**db_config)
+                    conn.close()
+                    # Если подключение успешно, показываем диалог выбора камер
+                    self.show_camera_selection()
+                except mysql.connector.Error as err:
+                    # Если не удалось подключиться к MySQL, предлагаем ручной ввод
+                    reply = QMessageBox.question(
+                        self, 'Ошибка подключения',
+                        'Не удалось подключиться к серверу MySQL. Хотите ввести URL камер вручную?',
+                        QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
+                    )
+                    if reply == QMessageBox.Yes:
+                        self.add_cameras_manually()
         except Exception as e:
             logging.error(f"Error connecting cameras: {e}")
             QMessageBox.critical(self, "Ошибка", f"Ошибка при подключении камер: {str(e)}")
 
+    def add_cameras_manually(self):
+        """Добавляет камеры вручную, если не удалось подключиться к MySQL"""
+        try:
+            # Запрашиваем количество камер
+            num_cameras, ok = QInputDialog.getInt(
+                self, "Ручной ввод камер", "Введите количество камер:", 1, 1, 4, 1
+            )
+            if not ok:
+                return
+
+            # Очищаем предыдущие данные
+            self.release_cameras()
+            self.clear_video_streams()
+            self.camera_ids = []
+            self.camera_info = {}
+            self.camera_names = []
+
+            camera_urls = []
+            for i in range(num_cameras):
+                url, ok = QInputDialog.getText(
+                    self, f"Камера {i + 1}", f"Введите URL для камеры {i + 1}:",
+                    QLineEdit.Normal, "http://192.168.1.106:4747/mjpegfeed?960x720"
+                )
+                if ok and url:
+                    camera_urls.append(url)
+                else:
+                    return
+
+            # Устанавливаем ручные URL камер
+            self.camera_urls = camera_urls
+            self.usb_enabled = False
+
+            # Создаем временные камеры для отображения
+            for i, url in enumerate(camera_urls):
+                cap = cv2.VideoCapture(url)
+                if cap.isOpened():
+                    video_label = QLabel(self)
+                    video_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+                    video_label.setAlignment(Qt.AlignCenter)
+                    self.video_labels.append((cap, video_label))
+                    self.video_layout.addWidget(video_label, i // 2, i % 2)
+
+                    # Добавляем информацию о камере
+                    self.camera_info[i] = {
+                        'ip': url,
+                        'name': f"Ручная камера {i + 1}"
+                    }
+                    self.camera_ids.append(i)  # Используем индекс как ID
+                    self.camera_names.append(f"Ручная камера {i + 1}")
+
+            if self.video_labels:
+                self.timer.start(1000 // self.fps_limit)
+                self.connect_button.setText("Отключить")
+                self.pause_button.setEnabled(True)
+                self.camera_connected_changed.emit(True)
+                logging.info(f"Ручные камеры подключены: {self.camera_urls}")
+            else:
+                QMessageBox.warning(self, "Ошибка", "Не удалось подключиться ни к одной из указанных камер")
+        except Exception as e:
+            logging.error(f"Error in manual camera addition: {e}")
+            QMessageBox.critical(self, "Ошибка", f"Ошибка при ручном добавлении камер: {str(e)}")
+
+    def clear_video_streams(self):
+        """Clears all video displays by setting empty pixmaps"""
+        for _, video_label in self.video_labels:
+            video_label.clear()
+            video_label.setText("Камера отключена")
+            video_label.setStyleSheet("background-color: #333; color: white;")
+            video_label.setAlignment(Qt.AlignCenter)
+
+        for i in reversed(range(self.video_layout.count())):
+            widget = self.video_layout.itemAt(i).widget()
+            if widget is not None:
+                widget.setParent(None)
+        self.video_labels.clear()
+
+        self.best_text = None
+        self.best_score = 0.0
+        self.last_direction = None
+        self.last_recognized_plate = None
+        self.last_recognized_score = 0.0
+
+
+
     def release_cameras(self):
         try:
-            if self.cap1 and self.cap1.isOpened():
-                self.cap1.release()
-            if self.cap2 and self.cap2.isOpened():
-                self.cap2.release()
-            if self.video_cap and self.video_cap.isOpened():
-                self.video_cap.release()
-            if hasattr(self, 'usb_cap') and self.usb_cap and self.usb_cap.isOpened():
-                self.usb_cap.release()
+            for cap, _ in self.video_labels:
+                if cap and cap.isOpened():
+                    cap.release()
+            self.video_labels.clear()
         except Exception as e:
             logging.error(f"Error releasing cameras: {e}")
 
-        self.cap1 = None
-        self.cap2 = None
-        self.video_cap = None
-        self.usb_cap = None
+    def determine_car_type(self, frame):
+        """Определяет тип автомобиля по изображению"""
+        # Ваша логика определения типа автомобиля
+        # Например, можно использовать coco_model для классификации
+        return "Car"  # Временная заглушка
 
     def restart_video_streams(self):
         self.release_cameras()
 
         try:
-            if self.current_camera == "Камера 1" and self.camera_urls[0]:
+            if self.current_camera.startswith("Камера из БД") and hasattr(self, 'current_camera_url'):
+                # Обработка камеры из базы данных
+                self.cap1 = cv2.VideoCapture(self.current_camera_url)
+                if not self.cap1.isOpened():
+                    logging.error(f"Error opening video stream from DB: {self.current_camera_url}")
+                    self.cap1 = None
+                    return False
+                logging.info(f"Successfully connected to camera from DB: {self.current_camera_url}")
+                return True
+
+            elif self.current_camera == "Камера 1" and self.camera_urls[0]:
                 self.cap1 = cv2.VideoCapture(self.camera_urls[0])
                 if not self.cap1.isOpened():
                     logging.error(f"Error opening video stream for camera 1: {self.camera_urls[0]}")
@@ -763,30 +1189,54 @@ class VideoApp(QWidget):
             if self.connection_status == "connected":
                 self.connection_status_changed.emit("disconnected")
 
-    def send_frame(self, frame):
+    def send_frame(self, frame, camera_id):
         try:
             if not self.server_ip or not self.server_port:
                 logging.error("Server IP or port not set")
-                return
+                return False
 
+            # Получаем информацию о камере
+            camera_data = self.camera_info.get(camera_id)
+            if not camera_data:
+                logging.error(f"No camera info for id: {camera_id}")
+                return False
+
+            # Подготовка кадра
             small_frame = cv2.resize(frame, (1280, 720))
             encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 70]
             _, buffer = cv2.imencode('.jpg', small_frame, encode_param)
             jpg_as_text = base64.b64encode(buffer).decode('utf-8')
+
+            # Формируем данные для отправки
+            payload = {
+                "camera_id": str(camera_id),
+                "camera_ip": camera_data['ip'],
+                "frame": jpg_as_text
+            }
+
+            logging.debug(f"Sending frame from camera {camera_id} ({camera_data['name']})")
+
             response = requests.post(
                 f"http://{self.server_ip}:{self.server_port}/upload",
-                json={"frame": jpg_as_text},
-                timeout=0.5
+                json=payload,
+                timeout=1.0  # Увеличиваем таймаут
             )
+
             if response.status_code != 200:
                 logging.error(f"Server error: {response.status_code} - {response.text}")
                 self.connection_status_changed.emit("disconnected")
+                return False
+
+            return True
+
         except requests.exceptions.RequestException as e:
             logging.error(f"Network error: {e}")
             self.connection_status_changed.emit("disconnected")
+            return False
         except Exception as e:
             logging.error(f"Error in send_frame: {e}")
             self.connection_status_changed.emit("disconnected")
+            return False
 
     def set_fps_limit(self):
         try:
@@ -824,84 +1274,190 @@ class VideoApp(QWidget):
             logging.error(f"Error toggling pause: {e}")
             QMessageBox.critical(self, "Ошибка", f"Ошибка при переключении паузы: {str(e)}")
 
+    def show_camera_management(self):
+        """Показывает диалог управления камерами"""
+        try:
+            logging.info("Opening camera management dialog")
+            dialog = CameraManagementDialog(self)
+            dialog.exec_()
+
+            # После закрытия диалога можно обновить список камер в настройках
+            # Например, если были добавлены новые камеры
+            self.update_camera_list_from_db()
+        except Exception as e:
+            logging.error(f"Error in camera management dialog: {e}")
+            QMessageBox.critical(self, "Ошибка", f"Ошибка в управлении камерами: {str(e)}")
+
+    def update_camera_list_from_db(self):
+        """Обновляет список камер из базы данных"""
+        try:
+            conn = mysql.connector.connect(**db_config)
+            cursor = conn.cursor(dictionary=True)
+
+            cursor.execute("SELECT ip_address FROM camera")
+            cameras = cursor.fetchall()
+
+            # Обновляем self.camera_urls (первые две камеры)
+            for i, camera in enumerate(cameras[:2]):
+                self.camera_urls[i] = camera['ip_address']
+
+            cursor.close()
+            conn.close()
+
+        except mysql.connector.Error as err:
+            logging.error(f"Database error: {err}")
+
     def update_frame(self):
         try:
-            if not any([self.cap1, self.cap2, self.video_cap, hasattr(self, 'usb_cap')]):
+            if not self.video_labels:
                 return
 
-            start_time = time.time()
-            ret, frame = self.get_current_frame()
-            if not ret or frame is None:
-                return
+            for idx, (cap, video_label) in enumerate(self.video_labels):
+                start_time = time.time()
+                ret, frame = cap.read()
+                if not ret or frame is None:
+                    continue
 
-            # frame = cv2.resize(frame, (1920, 1080))
-            results = model_prediction(frame, self.coco_model, self.license_plate_detector, reader)
+                camera_id = idx  # По умолчанию используем индекс как ID
+                if idx < len(self.camera_ids):
+                    camera_id = self.camera_ids[idx]
 
-            # Обработка всех обнаруженных номеров
-            if len(results) >= 6:  # Теперь возвращается 6 значений
-                processed_frame, texts, crops, current_best_text, current_best_score, direction = results
+                # Детекция транспортных средств (из старой версии)
+                detections = self.coco_model(frame)[0]
+                detections_ = []
+                car_detections = {}
+                for detection in detections.boxes.data.tolist():
+                    x1, y1, x2, y2, score, class_id = detection
+                    if int(class_id) in self.vehicles:
+                        detections_.append([x1, y1, x2, y2, score])
+                        car_detections[(x1, y1, x2, y2)] = int(class_id)
 
-                # Обновляем лучший результат
-                if current_best_score > self.best_score:
-                    self.best_text = current_best_text
-                    self.best_score = current_best_score
-                    self.last_direction = direction
-                    logging.info(
-                        f"Новый лучший результат: {self.best_text} ({self.best_score:.2f}), направление: {direction}")
+                # Трекинг (из старой версии)
+                track_ids = self.mot_tracker.update(np.asarray(detections_)) if detections_ else []
 
-                # Новая логика вывода номеров
-                if current_best_score > 0.85:
-                    if self.last_recognized_plate != current_best_text:
-                        display_text = f"{current_best_text} ({current_best_score:.2f})"
-                        if direction:
-                            display_text += f" {direction}"
-                        self.plate_text_display.append(display_text)
+                # Обработка номеров (новая версия)
+                results = model_prediction(frame, self.coco_model, self.license_plate_detector, reader)
+
+                if len(results) >= 6:
+                    processed_frame, texts, crops, current_best_text, current_best_score, direction = results
+
+                    # Обновляем лучший результат
+                    if current_best_score > self.best_score:
+                        self.best_text = current_best_text
+                        self.best_score = current_best_score
+                        self.last_direction = direction
+                        logging.info(
+                            f"Новый лучший результат: {self.best_text} ({self.best_score:.2f}), направление: {direction}")
+
+                    # Новая логика вывода номеров с сохранением в БД
+                    if current_best_score > 0.85 and current_best_text != self.last_recognized_plate:
                         self.last_recognized_plate = current_best_text
                         self.last_recognized_score = current_best_score
 
-                        _, buffer = cv2.imencode('.jpg', processed_frame)
-                        if buffer is not None:
-                            photo_bytes = buffer.tobytes()
-                            current_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                            car_type = "Car"  # Можно определить более точно из результатов детекции
-                            self.insert_car_data(
-                                self.last_recognized_plate,
-                                photo_bytes,
-                                car_type,
-                                current_date
-                            )
+                        # Определяем тип авто (из старой версии)
+                        car_type = None
+                        for license_plate in self.license_plate_detector(frame)[0].boxes.data.tolist():
+                            x1, y1, x2, y2, score, class_id = license_plate
+                            xcar1, ycar1, xcar2, ycar2, car_id = self.get_car(license_plate, track_ids)
+                            if car_id != -1:
+                                car_key = (xcar1, ycar1, xcar2, ycar2)
+                                if car_key in car_detections:
+                                    car_type = "Car" if car_detections[car_key] == 2 else "Truck"
+                                    break
 
-                        logging.info(f"Отображен новый номер: {current_best_text}, направление: {direction}")
+                        if not car_type:
+                            car_type = "Car"  # значение по умолчанию
 
-            # Отображение FPS
-            if self.show_fps:
-                current_fps = self.calculate_fps(start_time)
+                        # Сохранение в БД (из старой версии)
+                        try:
+                            _, buffer = cv2.imencode('.jpg', processed_frame)
+                            if buffer is not None:
+                                photo_bytes = buffer.tobytes()
+                                current_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                                self.insert_car_data(
+                                    current_best_text,
+                                    photo_bytes,
+                                    car_type,
+                                    current_date,
+                                    self.camera_names[idx] if hasattr(self, 'camera_names') and idx < len(
+                                        self.camera_names) else None
+                                )
+                        except Exception as e:
+                            logging.error(f"Ошибка при сохранении в БД: {e}")
+
+                        # Отображение информации
+                        if hasattr(self, 'plate_text_display'):
+                            display_text = f"{current_best_text} ({current_best_score:.2f})"
+                            if direction:
+                                display_text += f" {direction}"
+                            self.plate_text_display.append(display_text)
+
+                # Отображение FPS (из новой версии)
+                if self.show_fps:
+                    current_fps = self.calculate_fps(start_time)
+                    processed_frame = draw_license_plate_text(
+                        processed_frame,
+                        f"FPS: {current_fps:.2f}",
+                        (10, 10)
+                    )
+
+                # Добавление названия камеры в верхнем правом углу
+                camera_name = self.camera_names[idx]
                 processed_frame = draw_license_plate_text(
                     processed_frame,
-                    f"FPS: {current_fps:.2f}",
-                    (10, 10)
+                    camera_name,
+                    (frame.shape[2] - 400, 10),  # Координаты для верхнего правого угла
                 )
 
-            # Всегда отображаем лучший результат, если он есть
-            if self.last_recognized_plate and self.last_recognized_score > 0.85:
-                display_text = f"{self.last_recognized_plate} ({self.last_recognized_score:.2f})"
-                if self.last_direction:
-                    display_text += f" {self.last_direction}"
+                # Всегда отображаем лучший результат, если он есть
+                if self.last_recognized_plate and self.last_recognized_score > 0.85:
+                    display_text = f"{self.last_recognized_plate} ({self.last_recognized_score:.2f})"
+                    if self.last_direction:
+                        display_text += f" {self.last_direction}"
 
-                processed_frame = draw_best_result(
-                    processed_frame,
-                    display_text,
-                    self.last_recognized_score,
-                    (350, 10)
-                )
+                    processed_frame = draw_best_result(
+                        processed_frame,
+                        display_text,
+                        self.last_recognized_score,
+                        (350, 10)
+                    )
 
-            self.display_processed_frame(processed_frame)
+                self.display_processed_frame(processed_frame, video_label)
 
-            if self.is_streaming:
-                self.send_frame_to_stream(processed_frame)
+                if self.is_streaming:
+                    # Получаем camera_id для текущего потока
+                    if idx < len(self.camera_ids):
+                        camera_id = self.camera_ids[idx]
+                        self.send_frame_to_stream(processed_frame, idx) # idx - это идентификатор камеры
 
+        except RuntimeError as e:
+            if "CUDA out of memory" in str(e):
+                logging.error("CUDA memory error - trying to recover")
+                torch.cuda.empty_cache()
+                self.restart_video_streams()
+            else:
+                logging.error(f"Runtime error: {e}")
         except Exception as e:
-            logging.error(f"Error in update_frame: {e}")
+            logging.error(f"Unexpected error in update_frame: {e}")
+            self.release_cameras()
+            self.timer.stop()
+
+    def save_to_database(self, plate_text, frame, car_type, camera_id=None):
+        """Сохраняет данные в базу данных"""
+        try:
+            _, buffer = cv2.imencode('.jpg', frame)
+            if buffer is not None:
+                photo_bytes = buffer.tobytes()
+                current_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                self.insert_car_data(
+                    plate_text,
+                    photo_bytes,
+                    car_type,
+                    current_date,
+                    camera_id
+                )
+        except Exception as e:
+            logging.error(f"Ошибка при сохранении в БД: {e}")
 
     # def update_frame(self):
     #     try:
@@ -998,30 +1554,41 @@ class VideoApp(QWidget):
             self.frame_times.pop(0)
         return len(self.frame_times) / sum(self.frame_times)
 
-    def display_processed_frame(self, frame):
+    def display_processed_frame(self, frame, video_label):
         """Отображает обработанный кадр в интерфейсе"""
         height, width, channel = frame.shape
         q_img = QImage(frame.data, width, height, width * channel, QImage.Format_RGB888)
         pixmap = QPixmap.fromImage(q_img)
-        pixmap = pixmap.scaled(self.video_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        self.video_label.setPixmap(pixmap)
+        pixmap = pixmap.scaled(video_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        video_label.setPixmap(pixmap)
 
-    def send_frame_to_stream(self, frame):
+    def send_frame_to_stream(self, frame, camera_idx):
         """Отправляет кадр на сервер трансляции"""
         try:
-            self.frame_queue.put_nowait(frame.copy())
+            # Используем camera_idx напрямую, если camera_ids не заполнен
+            camera_id = camera_idx
+            if camera_idx < len(self.camera_ids):
+                camera_id = self.camera_ids[camera_idx]
+
+            self.frame_queue.put_nowait((frame.copy(), camera_id))
         except queue.Full:
             pass
 
     def streaming_worker(self):
         while True:
             try:
-                frame = self.frame_queue.get()
+                frame, camera_idx = self.frame_queue.get()
                 if frame is None:
                     break
-                self.send_frame(frame)
+
+                # Получаем camera_id по индексу
+                if camera_idx < len(self.camera_ids):
+                    camera_id = self.camera_ids[camera_idx]
+                    self.send_frame(frame, camera_id)
+
             except Exception as e:
                 logging.error(f"Error in streaming worker: {e}")
+                time.sleep(1)  # Задержка при ошибках
 
     def closeEvent(self, event):
         try:
