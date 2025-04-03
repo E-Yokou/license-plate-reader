@@ -16,8 +16,9 @@ logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %
 def main():
     try:
         # Load models
-        coco_model = YOLO('yolov8n.pt').to('cuda' if torch.cuda.is_available() else 'cpu')
-        license_plate_detector = YOLO('LicensePlateReader.pt').to('cuda' if torch.cuda.is_available() else 'cpu')
+        coco_model = YOLO('models/yolo11n.pt').to('cuda' if torch.cuda.is_available() else 'cpu')
+        license_plate_detector = YOLO(
+            'models/license_plate_detector.pt').to('cuda' if torch.cuda.is_available() else 'cpu')
         logging.info("Models loaded successfully.")
     except Exception as e:
         logging.error(f"Error loading models: {e}")

@@ -1019,11 +1019,6 @@ class VideoApp(QWidget):
                     self.video_labels.append((cap, video_label))
                     self.video_layout.addWidget(video_label, i // 2, i % 2)
 
-                    # Добавляем информацию о камере
-                    self.camera_info[i] = {
-                        'ip': url,
-                        'name': f"Ручная камера {i + 1}"
-                    }
                     self.camera_ids.append(i)  # Используем индекс как ID
                     self.camera_names.append(f"Ручная камера {i + 1}")
 
@@ -1322,7 +1317,7 @@ class VideoApp(QWidget):
                 if idx < len(self.camera_ids):
                     camera_id = self.camera_ids[idx]
 
-                # Детекция транспортных средств (из старой версии)
+                # Детекция транспортных средств
                 detections = self.coco_model(frame)[0]
                 detections_ = []
                 car_detections = {}
@@ -1332,29 +1327,26 @@ class VideoApp(QWidget):
                         detections_.append([x1, y1, x2, y2, score])
                         car_detections[(x1, y1, x2, y2)] = int(class_id)
 
-                # Трекинг (из старой версии)
+                # Трекинг
                 track_ids = self.mot_tracker.update(np.asarray(detections_)) if detections_ else []
 
-                # Обработка номеров (новая версия)
+                # Обработка номеров для текущей камеры
                 results = model_prediction(frame, self.coco_model, self.license_plate_detector, reader)
 
                 if len(results) >= 6:
                     processed_frame, texts, crops, current_best_text, current_best_score, direction = results
 
-                    # Обновляем лучший результат
-                    if current_best_score > self.best_score:
-                        self.best_text = current_best_text
-                        self.best_score = current_best_score
-                        self.last_direction = direction
+                    # Обновляем лучший результат для текущей камеры
+                    if current_best_score > getattr(self, f'best_score_{camera_id}', 0):
+                        setattr(self, f'best_text_{camera_id}', current_best_text)
+                        setattr(self, f'best_score_{camera_id}', current_best_score)
+                        setattr(self, f'last_direction_{camera_id}', direction)
                         logging.info(
-                            f"Новый лучший результат: {self.best_text} ({self.best_score:.2f}), направление: {direction}")
+                            f"Камера {camera_id}: новый лучший результат: {current_best_text} ({current_best_score:.2f})")
 
-                    # Новая логика вывода номеров с сохранением в БД
-                    if current_best_score > 0.85 and current_best_text != self.last_recognized_plate:
-                        self.last_recognized_plate = current_best_text
-                        self.last_recognized_score = current_best_score
-
-                        # Определяем тип авто (из старой версии)
+                    # Отображаем только если номер распознан на текущей камере
+                    if current_best_score > 0.85:
+                        # Определяем тип авто
                         car_type = None
                         for license_plate in self.license_plate_detector(frame)[0].boxes.data.tolist():
                             x1, y1, x2, y2, score, class_id = license_plate
@@ -1368,7 +1360,7 @@ class VideoApp(QWidget):
                         if not car_type:
                             car_type = "Car"  # значение по умолчанию
 
-                        # Сохранение в БД (из старой версии)
+                        # Сохранение в БД
                         try:
                             _, buffer = cv2.imencode('.jpg', processed_frame)
                             if buffer is not None:
@@ -1379,20 +1371,12 @@ class VideoApp(QWidget):
                                     photo_bytes,
                                     car_type,
                                     current_date,
-                                    self.camera_names[idx] if hasattr(self, 'camera_names') and idx < len(
-                                        self.camera_names) else None
+                                    self.camera_names[idx] if idx < len(self.camera_names) else None
                                 )
                         except Exception as e:
                             logging.error(f"Ошибка при сохранении в БД: {e}")
 
-                        # Отображение информации
-                        if hasattr(self, 'plate_text_display'):
-                            display_text = f"{current_best_text} ({current_best_score:.2f})"
-                            if direction:
-                                display_text += f" {direction}"
-                            self.plate_text_display.append(display_text)
-
-                # Отображение FPS (из новой версии)
+                # Отображение FPS
                 if self.show_fps:
                     current_fps = self.calculate_fps(start_time)
                     processed_frame = draw_license_plate_text(
@@ -1401,34 +1385,35 @@ class VideoApp(QWidget):
                         (10, 10)
                     )
 
-                # Добавление названия камеры в верхнем правом углу
-                camera_name = self.camera_names[idx]
-                processed_frame = draw_license_plate_text(
-                    processed_frame,
-                    camera_name,
-                    (frame.shape[2] - 400, 10),  # Координаты для верхнего правого угла
-                )
+                # # Добавление названия камеры
+                # camera_name = self.camera_names[idx]
+                # processed_frame = draw_license_plate_text(
+                #     processed_frame,
+                #     camera_name,
+                #     (frame.shape[1] - 400, 10),
+                # )
 
-                # Всегда отображаем лучший результат, если он есть
-                if self.last_recognized_plate and self.last_recognized_score > 0.85:
-                    display_text = f"{self.last_recognized_plate} ({self.last_recognized_score:.2f})"
-                    if self.last_direction:
-                        display_text += f" {self.last_direction}"
+                # Отображаем лучший результат для текущей камеры, если он есть
+                current_best_text = getattr(self, f'best_text_{camera_id}', None)
+                current_best_score = getattr(self, f'best_score_{camera_id}', 0)
+                current_direction = getattr(self, f'last_direction_{camera_id}', None)
+
+                if current_best_text and current_best_score > 0.85:
+                    display_text = f"{current_best_text} ({current_best_score:.2f})"
+                    if current_direction:
+                        display_text += f" {current_direction}"
 
                     processed_frame = draw_best_result(
                         processed_frame,
                         display_text,
-                        self.last_recognized_score,
+                        current_best_score,
                         (350, 10)
                     )
 
                 self.display_processed_frame(processed_frame, video_label)
 
                 if self.is_streaming:
-                    # Получаем camera_id для текущего потока
-                    if idx < len(self.camera_ids):
-                        camera_id = self.camera_ids[idx]
-                        self.send_frame_to_stream(processed_frame, idx) # idx - это идентификатор камеры
+                    self.send_frame_to_stream(processed_frame, idx)
 
         except RuntimeError as e:
             if "CUDA out of memory" in str(e):
@@ -1556,11 +1541,71 @@ class VideoApp(QWidget):
 
     def display_processed_frame(self, frame, video_label):
         """Отображает обработанный кадр в интерфейсе"""
-        height, width, channel = frame.shape
-        q_img = QImage(frame.data, width, height, width * channel, QImage.Format_RGB888)
-        pixmap = QPixmap.fromImage(q_img)
-        pixmap = pixmap.scaled(video_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        video_label.setPixmap(pixmap)
+        try:
+            # Получаем индекс камеры
+            idx = next(i for i, (_, label) in enumerate(self.video_labels) if label == video_label)
+
+            # Получаем название камеры
+            camera_name = self.camera_names[idx] if idx < len(self.camera_names) else f"Камера {idx + 1}"
+
+            # Создаем изображение с текстом названия камеры
+            height, width = frame.shape[:2]
+
+            # Конвертируем в PIL для использования DejaVuSans
+            pil_image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            draw = ImageDraw.Draw(pil_image)
+
+            try:
+                font = ImageFont.truetype("DejaVuSans.ttf", 30)
+            except:
+                font = ImageFont.load_default()
+
+            text = camera_name
+            margin = 10
+
+            # Рассчитываем размер текста
+            text_bbox = draw.textbbox((0, 0), text, font=font)
+            text_width = text_bbox[2] - text_bbox[0]
+            text_height = text_bbox[3] - text_bbox[1]
+
+            # Позиция в нижнем левом углу
+            pos_x = margin
+            pos_y = height - margin - text_height
+
+            # Рисуем красный прямоугольник
+            draw.rectangle(
+                [(pos_x, pos_y), (pos_x + text_width + 20, pos_y + text_height + 10)],
+                fill=(255, 0, 0)  # Красный
+            )
+
+            # Рисуем белый текст
+            draw.text(
+                (pos_x + 10, pos_y + 5),
+                text,
+                font=font,
+                fill=(255, 255, 255)  # Белый
+            )
+
+            # Конвертируем обратно в OpenCV формат
+            frame = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
+
+            # Отображаем кадр
+            height, width, channel = frame.shape
+            bytes_per_line = 3 * width
+            q_img = QImage(frame.data, width, height, bytes_per_line, QImage.Format_RGB888)
+            pixmap = QPixmap.fromImage(q_img)
+            pixmap = pixmap.scaled(video_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            video_label.setPixmap(pixmap)
+
+        except Exception as e:
+            logging.error(f"Error in display_processed_frame: {e}")
+            # Fallback to basic display if error occurs
+            height, width, channel = frame.shape
+            bytes_per_line = 3 * width
+            q_img = QImage(frame.data, width, height, bytes_per_line, QImage.Format_RGB888)
+            pixmap = QPixmap.fromImage(q_img)
+            pixmap = pixmap.scaled(video_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            video_label.setPixmap(pixmap)
 
     def send_frame_to_stream(self, frame, camera_idx):
         """Отправляет кадр на сервер трансляции"""

@@ -52,7 +52,7 @@ def model_prediction(img, coco_model, license_plate_detector, ocr_reader):
         class_name = coco_model.names[int(class_id)]
         vehicle_classes.add(int(class_id))
 
-        # Рисуем bounding box
+        # Рисуем bounding box для транспортных средств
         if int(class_id) in [2, 3, 5, 7]:  # Транспортные средства
             cv2.rectangle(img, (int(xcar1), int(ycar1)), (int(xcar2), int(ycar2)), (0, 0, 255), 3)
         elif int(class_id) in [72, 73]:  # Холодильник или поезд
@@ -65,10 +65,13 @@ def model_prediction(img, coco_model, license_plate_detector, ocr_reader):
     elif {7}.intersection(vehicle_classes):  # Если есть транспортное средство
         direction = "forward"
 
-    # Остальной код обработки номеров остается без изменений
+    # Детекция номерных знаков
     license_detections = license_plate_detector(img)[0]
     for license_plate in license_detections.boxes.data.tolist():
         x1, y1, x2, y2, score, class_id = license_plate
+
+        # Рисуем прямоугольник вокруг номерного знака (зеленый)
+        cv2.rectangle(img, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 3)
 
         license_plate_crop = img[int(y1):int(y2), int(x1):int(x2), :]
         license_plate_crop_gray = cv2.cvtColor(license_plate_crop, cv2.COLOR_BGR2GRAY)
@@ -76,20 +79,49 @@ def model_prediction(img, coco_model, license_plate_detector, ocr_reader):
         plate_text, plate_score = read_license_plate(license_plate_crop_gray)
 
         if plate_text and plate_score > 0.85:  # Фильтрация по score
+            # Создаем PIL изображение для отрисовки текста с DejaVuSans
+            pil_img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+            draw = ImageDraw.Draw(pil_img)
+
+            try:
+                font = ImageFont.truetype("DejaVuSans.ttf", 30)
+            except:
+                font = ImageFont.load_default()
+
+            text = f"{plate_text} ({plate_score:.2f})"
+
+            # Рассчитываем размер текста
+            text_bbox = draw.textbbox((0, 0), text, font=font)
+            text_width = text_bbox[2] - text_bbox[0]
+            text_height = text_bbox[3] - text_bbox[1]
+
+            # Позиция текста над bounding box'ом номера
+            text_x = int(x1)
+            text_y = int(y1) - text_height - 10 if int(y1) - text_height - 10 > 0 else int(y1) + 10
+
+            # Рисуем прямоугольник фона (белый)
+            draw.rectangle(
+                [(text_x, text_y), (text_x + text_width + 20, text_y + text_height + 10)],
+                fill=(255, 255, 255)
+            )
+
+            # Рисуем текст (черный)
+            draw.text(
+                (text_x + 10, text_y + 5),
+                text,
+                font=font,
+                fill=(0, 0, 0)
+            )
+
+            # Конвертируем обратно в OpenCV формат
+            img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+
             plates_to_draw.append({
                 'text': plate_text,
                 'score': plate_score,
                 'position': (int(x1), int(y1) - 40),
                 'bbox': (int(x1), int(y1), int(x2), int(y2))
             })
-
-    # Отрисовка всех подходящих номеров
-    for plate in plates_to_draw:
-        cv2.rectangle(img, plate['bbox'][:2], plate['bbox'][2:], (0, 255, 0), 2)
-        text = f"{plate['text']} ({plate['score']:.2f})"
-        img = draw_license_plate_text(img, text, plate['position'])
-        licenses_texts.append(text)
-        license_plate_crops.append(license_plate_crop)
 
     # Находим номер с максимальным score в текущем кадре
     current_best = max(plates_to_draw, key=lambda x: x['score'], default=None)
@@ -115,8 +147,13 @@ def draw_best_result(image, best_text, best_score, position):
         pil_image = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
         draw = ImageDraw.Draw(pil_image)
 
-        font = ImageFont.truetype("DejaVuSans.ttf", 30)
-        text = f"{best_text} ({best_score:.2f})"
+        try:
+            # Пробуем загрузить DejaVuSans.ttf, если не получится - используем стандартный шрифт
+            font = ImageFont.truetype("DejaVuSans.ttf", 30)
+        except:
+            font = ImageFont.load_default()
+
+        text = f"{best_text}"
 
         text_bbox = draw.textbbox((0, 0), text, font=font)
         text_width = text_bbox[2] - text_bbox[0]
@@ -143,8 +180,8 @@ def draw_license_plate_text(image, text, position, font_size=30, bg_color=(255, 
         pil_image = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
         draw = ImageDraw.Draw(pil_image)
 
-        # Загружаем шрифт
         try:
+            # Пробуем загрузить DejaVuSans.ttf
             font = ImageFont.truetype("DejaVuSans.ttf", font_size)
         except:
             font = ImageFont.load_default()
