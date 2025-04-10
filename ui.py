@@ -20,7 +20,7 @@ from PyQt5.QtGui import QImage, QPixmap, QColor, QPainter, QPen
 from PIL import ImageFont, ImageDraw, Image
 import cv2
 import requests
-from util import model_prediction, reader, draw_best_result, db_config
+from util import model_prediction, reader, draw_best_result, db_config, draw_tracked_plate
 from queue import Queue
 import socket
 import os
@@ -478,13 +478,14 @@ class VideoApp(QWidget):
         self.recognized_plates = set()
         self.frame_times = []
 
+        self.tracked_plates = {}
+
         # Добавляем список для хранения названий камер
         self.camera_names = []
 
         # Connect signals
         self.connection_status_changed.connect(self.update_connection_status)
         self.camera_connected_changed.connect(self.update_camera_button_status)
-
 
     def init_ui(self):
         self.setWindowTitle("Vehicle & License Plate Recognition")
@@ -507,6 +508,13 @@ class VideoApp(QWidget):
         self.connect_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
         self.connect_button.clicked.connect(self.connect_cameras)
         self.bottom_panel.addWidget(self.connect_button)
+
+        # Add camera switch button
+        self.camera_switch_button = QPushButton("Переключить камеру", self)
+        self.camera_switch_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+        self.camera_switch_button.clicked.connect(self.switch_camera)
+        self.camera_switch_button.setEnabled(False)
+        self.bottom_panel.addWidget(self.camera_switch_button)
 
         # Create main layout
         layout = QVBoxLayout()
@@ -541,6 +549,25 @@ class VideoApp(QWidget):
         self.exit_action.triggered.connect(self.close)
         self.file_menu.addAction(self.exit_action)
         self.menu_bar.addMenu(self.file_menu)
+
+        # Settings menu
+        self.settings_menu = QMenu("Настройки", self.menu_bar)
+
+        # Threshold selection
+        self.threshold_action = QAction("Порог распознавания", self)
+        self.threshold_action.triggered.connect(self.set_recognition_threshold)
+        self.settings_menu.addAction(self.threshold_action)
+
+        # Добавляем пункт для отключения шаблонной обработки
+        self.template_processing_action = QAction("Шаблоны номеров", self, checkable=True)
+        self.template_processing_action.setChecked(True)  # Включено по умолчанию
+        self.template_processing_action.triggered.connect(self.toggle_template_processing)
+        self.settings_menu.addAction(self.template_processing_action)
+
+        self.menu_bar.addMenu(self.settings_menu)
+
+        # Добавил переменную для хранения текущего порога
+        self.recognition_threshold = 0.85  # Значение по умолчанию
 
         # Camera menu
         self.camera_menu = QMenu("Камеры", self.menu_bar)
@@ -596,6 +623,31 @@ class VideoApp(QWidget):
         self.status_bar.addStretch()
 
         layout.addLayout(self.status_bar)
+
+    def toggle_template_processing(self):
+        """Включает/выключает обработку текста под шаблоны номерных знаков"""
+        self.template_processing_enabled = self.template_processing_action.isChecked()
+        logging.info(
+            f"Обработка под шаблоны номеров: {'включена' if self.template_processing_enabled else 'выключена'}")
+
+    def set_recognition_threshold(self):
+        """Устанавливает порог вероятности для распознавания номеров"""
+        try:
+            threshold, ok = QInputDialog.getDouble(
+                self,
+                "Порог распознавания",
+                "Введите порог вероятности (0.1-0.99):",
+                self.recognition_threshold,
+                0.1,
+                0.99,
+                2
+            )
+            if ok:
+                self.recognition_threshold = threshold
+                logging.info(f"Установлен новый порог распознавания: {threshold}")
+        except Exception as e:
+            logging.error(f"Ошибка при установке порога: {e}")
+            QMessageBox.critical(self, "Ошибка", f"Ошибка при установке порога: {str(e)}")
 
     def show_camera_selection(self):
         try:
@@ -973,6 +1025,8 @@ class VideoApp(QWidget):
                     )
                     if reply == QMessageBox.Yes:
                         self.add_cameras_manually()
+                if self.current_camera == "Видеофайл":
+                    self.load_video()
         except Exception as e:
             logging.error(f"Error connecting cameras: {e}")
             QMessageBox.critical(self, "Ошибка", f"Ошибка при подключении камер: {str(e)}")
@@ -1054,14 +1108,15 @@ class VideoApp(QWidget):
         self.last_recognized_plate = None
         self.last_recognized_score = 0.0
 
-
-
     def release_cameras(self):
         try:
             for cap, _ in self.video_labels:
                 if cap and cap.isOpened():
                     cap.release()
             self.video_labels.clear()
+            if hasattr(self, 'video_cap') and self.video_cap:
+                self.video_cap.release()
+                self.video_cap = None
         except Exception as e:
             logging.error(f"Error releasing cameras: {e}")
 
@@ -1136,16 +1191,50 @@ class VideoApp(QWidget):
                 "Video Files (*.mp4 *.avi *.mov);;All Files (*)",
                 options=options
             )
-            if file_name:
+            if file_name and os.path.exists(file_name):
                 self.video_file = file_name
                 self.current_camera = "Видеофайл"
                 logging.info(f"Video file selected: {file_name}")
                 self.update_camera_buttons()
                 if not self.timer.isActive():
                     self.connect_cameras()
+            else:
+                logging.error("Selected video file does not exist.")
+                QMessageBox.critical(self, "Ошибка", "Выбранный видеофайл не существует.")
         except Exception as e:
             logging.error(f"Error loading video file: {e}")
             QMessageBox.critical(self, "Ошибка", f"Ошибка при загрузке видео: {str(e)}")
+
+    def load_video(self):
+        try:
+            logging.info("Loading video file for playback")
+            if not os.path.exists(self.video_file):
+                logging.error(f"Video file does not exist: {self.video_file}")
+                QMessageBox.critical(self, "Ошибка", f"Видеофайл не существует: {self.video_file}")
+                return
+
+            self.video_cap = cv2.VideoCapture(self.video_file)
+            if not self.video_cap.isOpened():
+                logging.error(f"Error opening video file: {self.video_file}")
+                self.video_cap = None
+                QMessageBox.critical(self, "Ошибка", f"Ошибка открытия видеофайла: {self.video_file}")
+                return
+
+            self.video_labels.clear()
+            video_label = QLabel(self)
+            video_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            video_label.setAlignment(Qt.AlignCenter)
+            self.video_labels.append((self.video_cap, video_label))
+            self.video_layout.addWidget(video_label, 0, 0)
+
+            self.timer.start(1000 // self.fps_limit)
+            self.connect_button.setText("Отключить")
+            self.pause_button.setEnabled(True)
+            self.camera_connected_changed.emit(True)
+            logging.info("Video file loaded and playback started")
+        except Exception as e:
+            logging.error(f"Error loading video for playback: {e}")
+            QMessageBox.critical(self, "Ошибка", f"Ошибка при загрузке видео для воспроизведения: {str(e)}")
 
     def show_about(self):
         QMessageBox.about(self, "О программе",
@@ -1185,49 +1274,54 @@ class VideoApp(QWidget):
                 self.connection_status_changed.emit("disconnected")
 
     def send_frame(self, frame, camera_id):
+        """Отправляет кадр на сервер трансляции с минимальными данными о камере"""
         try:
             if not self.server_ip or not self.server_port:
                 logging.error("Server IP or port not set")
                 return False
 
-            # Получаем информацию о камере
+            # Получаем только необходимые данные о камере
             camera_data = self.camera_info.get(camera_id)
             if not camera_data:
                 logging.error(f"No camera info for id: {camera_id}")
                 return False
 
-            # Подготовка кадра
+            # Подготовка кадра (уменьшаем размер для экономии трафика)
             small_frame = cv2.resize(frame, (1280, 720))
-            encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 70]
-            _, buffer = cv2.imencode('.jpg', small_frame, encode_param)
-            jpg_as_text = base64.b64encode(buffer).decode('utf-8')
+            success, buffer = cv2.imencode('.jpg', small_frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+            if not success:
+                logging.error("Failed to encode frame to JPEG")
+                return False
 
-            # Формируем данные для отправки
+            # Формируем минимальный payload
             payload = {
                 "camera_id": str(camera_id),
                 "camera_ip": camera_data['ip'],
-                "frame": jpg_as_text
+                "frame": base64.b64encode(buffer).decode('utf-8')
             }
 
-            logging.debug(f"Sending frame from camera {camera_id} ({camera_data['name']})")
+            logging.debug(f"Sending frame from camera {camera_id}")
 
-            response = requests.post(
-                f"http://{self.server_ip}:{self.server_port}/upload",
-                json=payload,
-                timeout=1.0  # Увеличиваем таймаут
-            )
+            # Отправка на сервер
+            try:
+                response = requests.post(
+                    f"http://{self.server_ip}:{self.server_port}/upload",
+                    json=payload,
+                    timeout=2.0
+                )
 
-            if response.status_code != 200:
-                logging.error(f"Server error: {response.status_code} - {response.text}")
+                if response.status_code != 200:
+                    logging.error(f"Server error: {response.status_code} - {response.text}")
+                    self.connection_status_changed.emit("disconnected")
+                    return False
+
+                return True
+
+            except requests.exceptions.RequestException as e:
+                logging.error(f"Network error: {e}")
                 self.connection_status_changed.emit("disconnected")
                 return False
 
-            return True
-
-        except requests.exceptions.RequestException as e:
-            logging.error(f"Network error: {e}")
-            self.connection_status_changed.emit("disconnected")
-            return False
         except Exception as e:
             logging.error(f"Error in send_frame: {e}")
             self.connection_status_changed.emit("disconnected")
@@ -1313,9 +1407,11 @@ class VideoApp(QWidget):
                 if not ret or frame is None:
                     continue
 
-                camera_id = idx  # По умолчанию используем индекс как ID
+                camera_id = idx
                 if idx < len(self.camera_ids):
                     camera_id = self.camera_ids[idx]
+
+                camera_name = self.camera_names[idx] if idx < len(self.camera_names) else f"Камера {idx + 1}"
 
                 # Детекция транспортных средств
                 detections = self.coco_model(frame)[0]
@@ -1331,50 +1427,95 @@ class VideoApp(QWidget):
                 track_ids = self.mot_tracker.update(np.asarray(detections_)) if detections_ else []
 
                 # Обработка номеров для текущей камеры
-                results = model_prediction(frame, self.coco_model, self.license_plate_detector, reader)
+                results = model_prediction(frame, self.coco_model, self.license_plate_detector,
+                                           reader, self.recognition_threshold)
 
-                if len(results) >= 6:
-                    processed_frame, texts, crops, current_best_text, current_best_score, direction = results
+                if len(results) >= 4:
+                    processed_frame, texts, crops, direction = results
 
-                    # Обновляем лучший результат для текущей камеры
-                    if current_best_score > getattr(self, f'best_score_{camera_id}', 0):
-                        setattr(self, f'best_text_{camera_id}', current_best_text)
-                        setattr(self, f'best_score_{camera_id}', current_best_score)
-                        setattr(self, f'last_direction_{camera_id}', direction)
-                        logging.info(
-                            f"Камера {camera_id}: новый лучший результат: {current_best_text} ({current_best_score:.2f})")
+                    # Обновляем tracked_plates для текущих треков
+                    current_time = time.time()
+                    for track in track_ids:
+                        xcar1, ycar1, xcar2, ycar2, track_id = track
+                        car_bbox = (xcar1, ycar1, xcar2, ycar2)
 
-                    # Отображаем только если номер распознан на текущей камере
-                    if current_best_score > 0.85:
-                        # Определяем тип авто
-                        car_type = None
-                        for license_plate in self.license_plate_detector(frame)[0].boxes.data.tolist():
-                            x1, y1, x2, y2, score, class_id = license_plate
-                            xcar1, ycar1, xcar2, ycar2, car_id = self.get_car(license_plate, track_ids)
-                            if car_id != -1:
-                                car_key = (xcar1, ycar1, xcar2, ycar2)
-                                if car_key in car_detections:
-                                    car_type = "Car" if car_detections[car_key] == 2 else "Truck"
-                                    break
+                        if track_id in self.tracked_plates:
+                            plate_info = self.tracked_plates[track_id]
+                            plate_info['last_seen'] = current_time
 
-                        if not car_type:
-                            car_type = "Car"  # значение по умолчанию
+                            # Рисуем номер над автомобилем
+                            processed_frame = draw_tracked_plate(
+                                processed_frame,
+                                plate_info['plate_text'],
+                                car_bbox,
+                                plate_info['plate_score']
+                            )
 
-                        # Сохранение в БД
-                        try:
-                            _, buffer = cv2.imencode('.jpg', processed_frame)
-                            if buffer is not None:
-                                photo_bytes = buffer.tobytes()
-                                current_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                                self.insert_car_data(
-                                    current_best_text,
-                                    photo_bytes,
-                                    car_type,
-                                    current_date,
-                                    self.camera_names[idx] if idx < len(self.camera_names) else None
-                                )
-                        except Exception as e:
-                            logging.error(f"Ошибка при сохранении в БД: {e}")
+                    # Добавляем новые номера в tracked_plates
+                    for license_plate in self.license_plate_detector(frame)[0].boxes.data.tolist():
+                        x1, y1, x2, y2, score, class_id = license_plate
+                        xcar1, ycar1, xcar2, ycar2, car_id = self.get_car(license_plate, track_ids)
+
+                        if car_id != -1:
+                            for text in texts:
+                                if text and text[1] > self.recognition_threshold:
+                                    plate_text, plate_score = text
+                                    self.tracked_plates[car_id] = {
+                                        'plate_text': plate_text,
+                                        'plate_score': plate_score,
+                                        'last_seen': current_time
+                                    }
+
+                    # Удаляем устаревшие треки
+                    to_delete = [tid for tid, plate in self.tracked_plates.items()
+                                 if current_time - plate['last_seen'] > 5.0]
+                    for tid in to_delete:
+                        del self.tracked_plates[tid]
+
+                    # Остальная существующая логика обработки номеров
+                    for text in texts:
+                        if text and text[1] > self.recognition_threshold:
+                            plate_text, plate_score = text
+                            display_text = f"{plate_text} ({plate_score:.2f})"
+                            if direction:
+                                display_text += f" {direction}"
+
+                                # Определяем тип авто
+                                car_type = None
+                                for license_plate in self.license_plate_detector(frame)[0].boxes.data.tolist():
+                                    x1, y1, x2, y2, score, class_id = license_plate
+                                    xcar1, ycar1, xcar2, ycar2, car_id = self.get_car(license_plate, track_ids)
+                                    if car_id != -1:
+                                        car_key = (xcar1, ycar1, xcar2, ycar2)
+                                        if car_key in car_detections:
+                                            car_type = "Car" if car_detections[car_key] == 2 else "Truck"
+                                            break
+
+                                if not car_type:
+                                    car_type = "Car"  # значение по умолчанию
+
+                                # if plate_text != getattr(self, f'last_saved_plate_{camera_id}', None):
+                                #     try:
+                                #         _, buffer = cv2.imencode('.jpg', processed_frame)
+                                #         if buffer is not None:
+                                #             photo_bytes = buffer.tobytes()
+                                #             current_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                                #             self.insert_car_data(
+                                #                 plate_text,
+                                #                 photo_bytes,
+                                #                 car_type,
+                                #                 current_date,
+                                #                 self.camera_names[idx] if idx < len(self.camera_names) else None
+                                #             )
+                                #             setattr(self, f'last_saved_plate_{camera_id}', plate_text)
+                                #     except Exception as e:
+                                #         logging.error(f"Ошибка при сохранении в БД: {e}")
+
+                            processed_frame = draw_license_plate_text(
+                                processed_frame,
+                                display_text,
+                                (10, 110)
+                            )
 
                 # Отображение FPS
                 if self.show_fps:
@@ -1382,32 +1523,7 @@ class VideoApp(QWidget):
                     processed_frame = draw_license_plate_text(
                         processed_frame,
                         f"FPS: {current_fps:.2f}",
-                        (10, 10)
-                    )
-
-                # # Добавление названия камеры
-                # camera_name = self.camera_names[idx]
-                # processed_frame = draw_license_plate_text(
-                #     processed_frame,
-                #     camera_name,
-                #     (frame.shape[1] - 400, 10),
-                # )
-
-                # Отображаем лучший результат для текущей камеры, если он есть
-                current_best_text = getattr(self, f'best_text_{camera_id}', None)
-                current_best_score = getattr(self, f'best_score_{camera_id}', 0)
-                current_direction = getattr(self, f'last_direction_{camera_id}', None)
-
-                if current_best_text and current_best_score > 0.85:
-                    display_text = f"{current_best_text} ({current_best_score:.2f})"
-                    if current_direction:
-                        display_text += f" {current_direction}"
-
-                    processed_frame = draw_best_result(
-                        processed_frame,
-                        display_text,
-                        current_best_score,
-                        (350, 10)
+                        (10, 30)
                     )
 
                 self.display_processed_frame(processed_frame, video_label)
@@ -1426,6 +1542,14 @@ class VideoApp(QWidget):
             logging.error(f"Unexpected error in update_frame: {e}")
             self.release_cameras()
             self.timer.stop()
+
+    def clean_old_tracks(self):
+        """Очищает треки, которые не обновлялись более 5 секунд"""
+        current_time = time.time()
+        to_delete = [tid for tid, plate in self.tracked_plates.items()
+                     if current_time - plate['last_seen'] > 5.0]
+        for tid in to_delete:
+            del self.tracked_plates[tid]
 
     def save_to_database(self, plate_text, frame, car_type, camera_id=None):
         """Сохраняет данные в базу данных"""
@@ -1620,15 +1744,20 @@ class VideoApp(QWidget):
             pass
 
     def streaming_worker(self):
+        """Рабочий поток для отправки кадров на сервер"""
         while True:
             try:
                 frame, camera_idx = self.frame_queue.get()
-                if frame is None:
+                if frame is None:  # Сигнал остановки
                     break
 
-                # Получаем camera_id по индексу
+                # Получаем camera_id
+                camera_id = camera_idx
                 if camera_idx < len(self.camera_ids):
                     camera_id = self.camera_ids[camera_idx]
+
+                # Отправляем только если трансляция активна
+                if self.is_streaming:
                     self.send_frame(frame, camera_id)
 
             except Exception as e:

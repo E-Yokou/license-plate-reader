@@ -17,8 +17,7 @@ def main():
     try:
         # Load models
         coco_model = YOLO('models/yolo11n.pt').to('cuda' if torch.cuda.is_available() else 'cpu')
-        license_plate_detector = YOLO(
-            'models/license_plate_detector.pt').to('cuda' if torch.cuda.is_available() else 'cpu')
+        license_plate_detector = YOLO('models/license_plate_detector.pt').to('cuda' if torch.cuda.is_available() else 'cpu')
         logging.info("Models loaded successfully.")
     except Exception as e:
         logging.error(f"Error loading models: {e}")
