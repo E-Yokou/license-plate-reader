@@ -25,7 +25,7 @@ db_config = {
 }
 
 dict_char_to_int = {
-    'О': '0', 'о': '0',
+    'О': '0', 'о': '0', 'Ы': 'М', 'Ч': 'У',
     'А': 'A', 'а': 'a', 'В': 'B', 'в': 'b',
     'Е': 'E', 'е': 'e', 'К': 'K', 'к': 'k',
     'М': 'M', 'м': 'm', 'Н': 'H', 'н': 'h',
@@ -97,6 +97,22 @@ def detect_license_plate_contour(license_plate_crop):
 
     return None
 
+def get_plate_center(bbox):
+    """Вычисляет центр bbox номерного знака"""
+    x1, y1, x2, y2 = bbox
+    return ((x1 + x2) / 2, (y1 + y2) / 2)
+
+def get_car_center(bbox):
+    """Вычисляет центр bbox автомобиля"""
+    x1, y1, x2, y2 = bbox
+    return ((x1 + x2) / 2, (y1 + y2) / 2)
+
+def is_plate_inside_car(plate_bbox, car_bbox):
+    """Проверяет, находится ли номер внутри bbox автомобиля"""
+    plate_center = get_plate_center(plate_bbox)
+    xcar1, ycar1, xcar2, ycar2 = car_bbox
+    return (xcar1 < plate_center[0] < xcar2 and
+            ycar1 < plate_center[1] < ycar2)
 
 def model_prediction(img, coco_model, license_plate_detector, ocr_reader, recognition_threshold=0.85):
     """Обработка изображения для обнаружения автомобилей и номерных знаков с улучшенным сопоставлением"""
@@ -108,33 +124,27 @@ def model_prediction(img, coco_model, license_plate_detector, ocr_reader, recogn
     # Детекция транспортных средств
     object_detections = coco_model(img)[0]
     vehicle_classes = set()
-    vehicle_boxes = []  # (x1, y1, x2, y2, class_id, area, center_x, center_y)
+    vehicle_boxes = []  # (x1, y1, x2, y2, class_id, score, area, center_x, center_y)
 
     for detection in object_detections.boxes.data.tolist():
         xcar1, ycar1, xcar2, ycar2, car_score, class_id = detection
         class_id = int(class_id)
-        vehicle_classes.add(class_id)
-        area = (xcar2 - xcar1) * (ycar2 - ycar1)
-        center_x = (xcar1 + xcar2) / 2
-        center_y = (ycar1 + ycar2) / 2
-        vehicle_boxes.append((xcar1, ycar1, xcar2, ycar2, class_id, area, center_x, center_y))
+        if class_id in [2, 3, 5, 7]:  # Только автомобили, грузовики и автобусы
+            vehicle_classes.add(class_id)
+            area = (xcar2 - xcar1) * (ycar2 - ycar1)
+            center_x = (xcar1 + xcar2) / 2
+            center_y = (ycar1 + ycar2) / 2
+            vehicle_boxes.append((xcar1, ycar1, xcar2, ycar2, class_id, car_score, area, center_x, center_y))
 
-        # Рисуем bounding box для транспортных средств
-        if class_id in [2, 3, 5, 7]:  # Транспортные средства
+            # Рисуем bounding box для транспортных средств
             cv2.rectangle(img, (int(xcar1), int(ycar1)), (int(xcar2), int(ycar2)), (0, 0, 255), 2)
-        elif class_id in [72, 73]:  # Холодильник или поезд
-            cv2.rectangle(img, (int(xcar1), int(ycar1)), (int(xcar2), int(ycar2)), (255, 0, 0), 2)
 
-    # Определяем направление
-    direction = ""
-    if {6, 72}.intersection(vehicle_classes):
-        direction = "backward"
-    elif {7}.intersection(vehicle_classes):
-        direction = "forward"
+    # Определяем направление (если нужно)
+    if {2, 3, 5, 7}.intersection(vehicle_classes):
+        direction = "forward"  # или другая логика определения направления
 
     # Детекция номерных знаков
     license_detections = license_plate_detector(img)[0]
-    current_texts = []
     plate_to_car_mapping = {}
 
     for license_plate in license_detections.boxes.data.tolist():
@@ -154,7 +164,7 @@ def model_prediction(img, coco_model, license_plate_detector, ocr_reader, recogn
         plate_text, plate_score = read_license_plate(license_plate_crop_gray)
 
         if plate_text and plate_score > recognition_threshold:
-            current_texts.append((plate_text, plate_score))
+            licenses_texts.append((plate_text, plate_score))
             license_plate_crops.append(license_plate_crop)
 
             # Ищем лучший matching автомобиль для этого номера
@@ -163,7 +173,7 @@ def model_prediction(img, coco_model, license_plate_detector, ocr_reader, recogn
             min_distance = float('inf')
 
             for vehicle_box in vehicle_boxes:
-                xcar1, ycar1, xcar2, ycar2, class_id, area, car_center_x, car_center_y = vehicle_box
+                xcar1, ycar1, xcar2, ycar2, class_id, car_score, area, car_center_x, car_center_y = vehicle_box
 
                 # Проверяем геометрическое соответствие (центр номера внутри bbox автомобиля)
                 center_inside = (xcar1 < plate_center_x < xcar2 and
@@ -172,17 +182,17 @@ def model_prediction(img, coco_model, license_plate_detector, ocr_reader, recogn
                 if not center_inside:
                     continue
 
-                # Проверяем размерное соответствие (номер не должен быть слишком большим относительно автомобиля)
+                # Проверяем размерное соответствие (номер не должен быть слишком большим)
                 size_ratio = plate_area / area
-                if size_ratio > 0.3:  # Номер не должен занимать больше 30% площади автомобиля
+                if size_ratio > 0.3:  # Номер не должен занимать >30% площади авто
                     continue
 
-                # Вычисляем расстояние между центром номера и центром автомобиля
+                # Вычисляем расстояние между центрами
                 distance = ((plate_center_x - car_center_x)**2 +
                            (plate_center_y - car_center_y)**2)**0.5
 
-                # Вычисляем score соответствия (чем меньше расстояние и size_ratio, тем лучше)
-                match_score = (1 / (distance + 1)) * (1 - size_ratio)
+                # Score соответствия (чем меньше расстояние и size_ratio, тем лучше)
+                match_score = (1 / (distance + 1)) * (1 - size_ratio) * car_score
 
                 if match_score > best_score:
                     best_score = match_score
@@ -190,10 +200,10 @@ def model_prediction(img, coco_model, license_plate_detector, ocr_reader, recogn
                     min_distance = distance
 
             if best_match:
-                xcar1, ycar1, xcar2, ycar2, class_id, area, _, _ = best_match
+                xcar1, ycar1, xcar2, ycar2, _, _, _, _, _ = best_match
                 plate_to_car_mapping[(plate_text, plate_score)] = (xcar1, ycar1, xcar2, ycar2)
 
-    # Рисуем номера над соответствующими автомобилями с учетом приоритетов
+    # Рисуем номера только над лучшими соответствиями
     used_vehicles = set()
     for (plate_text, plate_score), car_box in sorted(
             plate_to_car_mapping.items(),
@@ -214,8 +224,8 @@ def model_prediction(img, coco_model, license_plate_detector, ocr_reader, recogn
 
     img_wth_box = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-    if current_texts:
-        return [img_wth_box, current_texts, license_plate_crops, direction]
+    if licenses_texts:
+        return [img_wth_box, licenses_texts, license_plate_crops, direction]
     elif license_detections.boxes.cls.tolist():
         return [img_wth_box, [], None, direction]
     else:
@@ -330,38 +340,20 @@ def format_license(text):
     return license_plate_
 
 
-def read_license_plate(license_plate_crop, recognition_threshold=0.85):
-    """Read the license plate text from a cropped image with enhanced preprocessing."""
+def read_license_plate(license_plate_crop):
+    """Улучшенное распознавание номера с проверкой формата"""
     try:
-        # Получаем настройку обработки шаблонов из главного приложения
-        template_processing = getattr(QApplication.instance(), 'template_processing_enabled', True)
-
-        # Попытка выравнивания номера, если он под наклоном
-        contour = detect_license_plate_contour(cv2.cvtColor(license_plate_crop, cv2.COLOR_GRAY2BGR))
-        if contour is not None:
-            license_plate_crop = four_point_transform(license_plate_crop, contour)
-
         # Предварительная обработка изображения
         processed_img = preprocess_image(license_plate_crop)
 
-        # Параметры для улучшения распознавания
-        decoder = 'greedy'  # Можно попробовать 'beamsearch'
-        beamWidth = 5  # Для beamsearch
-        batch_size = 1
-
+        # Распознавание текста
         detections = reader.readtext(
             processed_img,
-            decoder=decoder,
-            beamWidth=beamWidth,
-            batch_size=batch_size,
+            decoder='greedy',
+            batch_size=1,
             detail=1,
-            paragraph=False,
-            min_size=20,
-            text_threshold=0.7,
-            low_text=0.4,
-            link_threshold=0.4,
-            canvas_size=2560,
-            mag_ratio=1.5
+            # allowlist='АВЕКМНОРСТУХ0123456789',
+            paragraph=False
         )
 
         best_text = None
@@ -374,51 +366,69 @@ def read_license_plate(license_plate_crop, recognition_threshold=0.85):
             # Удаляем лишние символы
             text = ''.join(c for c in text if c.isalnum())
 
-            if len(text) < 3:
+            if len(text) < 5:  # Минимальная длина номера
                 continue
 
-            # Проверяем формат номера (только если обработка шаблонов включена)
+            # Проверка формата номера
             formatted_text = format_license(text)
-            formatted_text = post_process_license(formatted_text)
+            if not license_complies_format(formatted_text):
+                continue
 
-            # Сохраняем результат с наивысшим score
             if score > best_score:
                 best_text = formatted_text
                 best_score = score
 
-        if best_text:
-            if not template_processing or license_complies_format(best_text):
-                logging.info(f"Valid plate: {best_text}, score: {best_score:.2f}")
-                return best_text, float(best_score)
-            else:
-                logging.info(f"Invalid format: {best_text}, score: {best_score:.2f}")
-        else:
-            logging.info("No plate found")
-
-        return None, 0.0 # Если номер не найден
+        return best_text, best_score if best_text else (None, 0.0)
 
     except Exception as e:
         logging.error(f"Error in read_license_plate: {e}")
         return None, 0.0
 
 
+def draw_tracking_info(image, car_bbox, plate_text=None, plate_score=None):
+    """Рисует информацию о трекинге на изображении"""
+    x1, y1, x2, y2 = map(int, car_bbox)
+
+    # Рисуем bounding box автомобиля
+    cv2.rectangle(image, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+    # Если есть номер, рисуем его
+    if plate_text:
+        text = f"{plate_text} ({plate_score:.2f})" if plate_score else plate_text
+        (text_width, text_height), _ = cv2.getTextSize(
+            text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+
+        # Фон для текста
+        cv2.rectangle(image,
+                      (x1, y1 - text_height - 10),
+                      (x1 + text_width + 10, y1),
+                      (0, 0, 255), -1)
+
+        # Сам текст
+        cv2.putText(image, text,
+                    (x1 + 5, y1 - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                    (255, 255, 255), 2)
+
+    return image
+
 def draw_tracked_plate(image, text, car_bbox, score=0.0):
     """Рисует номер над автомобилем с bounding box"""
     try:
-        # Получаем координаты автомобиля
-        xcar1, ycar1, xcar2, ycar2 = car_bbox
+        x1, y1, x2, y2 = car_bbox
 
-        # Создаем PIL изображение из OpenCV изображения
+        # Рисуем bounding box автомобиля
+        cv2.rectangle(image, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
+
+        # Создаем PIL изображение для текста
         pil_image = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
         draw = ImageDraw.Draw(pil_image)
 
         try:
-            # Пробуем загрузить шрифт
-            font = ImageFont.truetype("DejaVuSans.ttf", 30)
+            font = ImageFont.truetype("DejaVuSans.ttf", 24)
         except:
             font = ImageFont.load_default()
 
-        # Формируем текст
         display_text = f"{text} ({score:.2f})"
 
         # Рассчитываем размер текста
@@ -426,15 +436,15 @@ def draw_tracked_plate(image, text, car_bbox, score=0.0):
         text_width = text_bbox[2] - text_bbox[0]
         text_height = text_bbox[3] - text_bbox[1]
 
-        # Позиция над bounding box автомобиля
-        text_x = int((xcar1 + xcar2) / 2 - text_width / 2)
-        text_y = ycar1 - text_height - 10
+        # Позиция над bounding box
+        text_x = int((x1 + x2) / 2 - text_width / 2)
+        text_y = y1 - text_height - 10
 
         # Рисуем прямоугольник фона
         draw.rectangle(
-            [(text_x - 10, text_y - 5),
-             (text_x + text_width + 10, text_y + text_height + 5)],
-            fill=(255, 255, 255)  # Белый фон
+            [(text_x - 5, text_y - 5),
+             (text_x + text_width + 5, text_y + text_height + 5)],
+            fill=(0, 0, 255)  # Синий фон
         )
 
         # Рисуем текст
@@ -442,10 +452,9 @@ def draw_tracked_plate(image, text, car_bbox, score=0.0):
             (text_x, text_y),
             display_text,
             font=font,
-            fill=(0, 0, 0)  # Черный текст
+            fill=(255, 255, 255)  # Белый текст
         )
 
-        # Конвертируем обратно в OpenCV формат
         return cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
     except Exception as e:
         logging.error(f"Error drawing tracked plate: {e}")

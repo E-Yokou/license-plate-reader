@@ -20,7 +20,8 @@ from PyQt5.QtGui import QImage, QPixmap, QColor, QPainter, QPen
 from PIL import ImageFont, ImageDraw, Image
 import cv2
 import requests
-from util import model_prediction, reader, draw_best_result, db_config, draw_tracked_plate
+from util import model_prediction, reader, draw_best_result, db_config, draw_tracked_plate, license_complies_format, \
+    read_license_plate, get_plate_center, get_car_center, is_plate_inside_car, draw_tracking_info
 from queue import Queue
 import socket
 import os
@@ -479,6 +480,8 @@ class VideoApp(QWidget):
         self.frame_times = []
 
         self.tracked_plates = {}
+        self.tracked_plates = {}  # {track_id: {'plate_text': str, 'plate_score': float, 'last_seen': float}}
+        self.plate_history = {}  # Для хранения истории номеров
 
         # Добавляем список для хранения названий камер
         self.camera_names = []
@@ -1401,133 +1404,179 @@ class VideoApp(QWidget):
             if not self.video_labels:
                 return
 
+            # Загрузка шрифта DejaVuSans с fallback
+            try:
+                font = ImageFont.truetype("DejaVuSans.ttf", 24)
+                font_small = ImageFont.truetype("DejaVuSans.ttf", 18)
+            except:
+                font = ImageFont.load_default()
+                font_small = ImageFont.load_default()
+                logging.warning("DejaVuSans.ttf not found, using default font")
+
             for idx, (cap, video_label) in enumerate(self.video_labels):
                 start_time = time.time()
                 ret, frame = cap.read()
                 if not ret or frame is None:
                     continue
 
-                camera_id = idx
-                if idx < len(self.camera_ids):
-                    camera_id = self.camera_ids[idx]
-
+                # Получаем ID и название камеры
+                camera_id = self.camera_ids[idx] if idx < len(self.camera_ids) else idx
                 camera_name = self.camera_names[idx] if idx < len(self.camera_names) else f"Камера {idx + 1}"
 
+                # Конвертируем в PIL изображение для работы со шрифтами
+                pil_img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                draw = ImageDraw.Draw(pil_img)
+
                 # Детекция транспортных средств
-                detections = self.coco_model(frame)[0]
-                detections_ = []
-                car_detections = {}
-                for detection in detections.boxes.data.tolist():
+                vehicle_detections = self.coco_model(frame)[0]
+                vehicle_boxes = []
+                for detection in vehicle_detections.boxes.data.tolist():
                     x1, y1, x2, y2, score, class_id = detection
-                    if int(class_id) in self.vehicles:
-                        detections_.append([x1, y1, x2, y2, score])
-                        car_detections[(x1, y1, x2, y2)] = int(class_id)
+                    if int(class_id) in [2, 3, 5, 7]:  # Только автомобили
+                        vehicle_boxes.append([x1, y1, x2, y2, score])
+                        # Рисуем bounding box автомобиля
+                        draw.rectangle([x1, y1, x2, y2], outline=(0, 255, 0), width=2)
 
-                # Трекинг
-                track_ids = self.mot_tracker.update(np.asarray(detections_)) if detections_ else []
+                # Трекинг транспортных средств
+                track_ids = self.mot_tracker.update(np.asarray(vehicle_boxes)) if vehicle_boxes else []
+                current_time = time.time()
 
-                # Обработка номеров для текущей камеры
-                results = model_prediction(frame, self.coco_model, self.license_plate_detector,
-                                           reader, self.recognition_threshold)
+                # Детекция номерных знаков
+                license_detections = self.license_plate_detector(frame)[0]
 
-                if len(results) >= 4:
-                    processed_frame, texts, crops, direction = results
+                # 1. Обновляем существующие треки
+                updated_vehicles = set()
+                for track in track_ids:
+                    xcar1, ycar1, xcar2, ycar2, track_id = track
+                    car_bbox = (xcar1, ycar1, xcar2, ycar2)
 
-                    # Обновляем tracked_plates для текущих треков
-                    current_time = time.time()
+                    if track_id in self.tracked_plates:
+                        # Проверяем, есть ли новый номер для этого авто
+                        new_plate = None
+                        for lp in license_detections.boxes.data.tolist():
+                            x1, y1, x2, y2, score, _ = lp
+                            if is_plate_inside_car((x1, y1, x2, y2), car_bbox):
+                                plate_crop = frame[int(y1):int(y2), int(x1):int(x2)]
+                                plate_text, plate_score = read_license_plate(plate_crop)
+
+                                if plate_text and plate_score >= self.recognition_threshold:
+                                    new_plate = (plate_text, plate_score)
+                                    break
+
+                        # Обновляем или сохраняем существующий номер
+                        if new_plate:
+                            self.tracked_plates[track_id] = {
+                                'plate_text': new_plate[0],
+                                'plate_score': new_plate[1],
+                                'last_seen': current_time
+                            }
+                        else:
+                            self.tracked_plates[track_id]['last_seen'] = current_time
+
+                        updated_vehicles.add(track_id)
+
+                # 2. Обрабатываем новые номера для необновленных авто
+                for lp in license_detections.boxes.data.tolist():
+                    x1, y1, x2, y2, score, _ = lp
+                    plate_bbox = (x1, y1, x2, y2)
+                    plate_crop = frame[int(y1):int(y2), int(x1):int(x2)]
+                    plate_text, plate_score = read_license_plate(plate_crop)
+
+                    if not plate_text or plate_score < self.recognition_threshold:
+                        continue
+
+                    # Ищем ближайший автомобиль без номера
+                    best_match = None
+                    min_distance = float('inf')
+
                     for track in track_ids:
                         xcar1, ycar1, xcar2, ycar2, track_id = track
+                        if track_id in updated_vehicles:
+                            continue
+
                         car_bbox = (xcar1, ycar1, xcar2, ycar2)
+                        if is_plate_inside_car(plate_bbox, car_bbox):
+                            distance = np.linalg.norm(
+                                np.array(get_plate_center(plate_bbox)) -
+                                np.array(get_car_center(car_bbox)))
 
-                        if track_id in self.tracked_plates:
-                            plate_info = self.tracked_plates[track_id]
-                            plate_info['last_seen'] = current_time
+                            if distance < min_distance:
+                                min_distance = distance
+                            best_match = track_id
 
-                            # Рисуем номер над автомобилем
-                            processed_frame = draw_tracked_plate(
-                                processed_frame,
-                                plate_info['plate_text'],
-                                car_bbox,
-                                plate_info['plate_score']
-                            )
+                            if best_match:
+                                self.tracked_plates[best_match] = {
+                                    'plate_text': plate_text,
+                                    'plate_score': plate_score,
+                                    'last_seen': current_time
+                                }
+                            updated_vehicles.add(best_match)
 
-                    # Добавляем новые номера в tracked_plates
-                    for license_plate in self.license_plate_detector(frame)[0].boxes.data.tolist():
-                        x1, y1, x2, y2, score, class_id = license_plate
-                        xcar1, ycar1, xcar2, ycar2, car_id = self.get_car(license_plate, track_ids)
+                            # Сохранение в базу данных
+                            if plate_text != getattr(self, f'last_saved_plate_{camera_id}', None):
+                                try:
+                                    _, buffer = cv2.imencode('.jpg', cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR))
+                                    self.insert_car_data(
+                                        plate_text,
+                                        buffer.tobytes(),
+                                        "Car",
+                                        datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                                        camera_id
+                                    )
+                                    setattr(self, f'last_saved_plate_{camera_id}', plate_text)
+                                except Exception as e:
+                                    logging.error(f"Ошибка сохранения в БД: {e}")
 
-                        if car_id != -1:
-                            for text in texts:
-                                if text and text[1] > self.recognition_threshold:
-                                    plate_text, plate_score = text
-                                    self.tracked_plates[car_id] = {
-                                        'plate_text': plate_text,
-                                        'plate_score': plate_score,
-                                        'last_seen': current_time
-                                    }
+                # 3. Визуализация номеров на автомобилях
+                for track in track_ids:
+                    x1, y1, x2, y2, track_id = track
+                    plate_info = self.tracked_plates.get(track_id)
 
-                    # Удаляем устаревшие треки
-                    to_delete = [tid for tid, plate in self.tracked_plates.items()
-                                 if current_time - plate['last_seen'] > 5.0]
-                    for tid in to_delete:
-                        del self.tracked_plates[tid]
+                    if plate_info:
+                        text = f"{plate_info['plate_text']} ({plate_info['plate_score']:.2f})"
+                        text_bbox = draw.textbbox((0, 0), text, font=font)
 
-                    # Остальная существующая логика обработки номеров
-                    for text in texts:
-                        if text and text[1] > self.recognition_threshold:
-                            plate_text, plate_score = text
-                            display_text = f"{plate_text} ({plate_score:.2f})"
-                            if direction:
-                                display_text += f" {direction}"
+                        # Рисуем подложку
+                        draw.rectangle(
+                            [x1, y1 - (text_bbox[3] - text_bbox[1]) - 10,
+                             x1 + (text_bbox[2] - text_bbox[0]) + 10, y1],
+                            fill=(0, 0, 255))
 
-                                # Определяем тип авто
-                                car_type = None
-                                for license_plate in self.license_plate_detector(frame)[0].boxes.data.tolist():
-                                    x1, y1, x2, y2, score, class_id = license_plate
-                                    xcar1, ycar1, xcar2, ycar2, car_id = self.get_car(license_plate, track_ids)
-                                    if car_id != -1:
-                                        car_key = (xcar1, ycar1, xcar2, ycar2)
-                                        if car_key in car_detections:
-                                            car_type = "Car" if car_detections[car_key] == 2 else "Truck"
-                                            break
+                        # Рисуем текст номера
+                        draw.text(
+                            (x1 + 5, y1 - (text_bbox[3] - text_bbox[1]) - 5),
+                            text,
+                            font=font,
+                            fill=(255, 255, 255))
 
-                                if not car_type:
-                                    car_type = "Car"  # значение по умолчанию
-
-                                # if plate_text != getattr(self, f'last_saved_plate_{camera_id}', None):
-                                #     try:
-                                #         _, buffer = cv2.imencode('.jpg', processed_frame)
-                                #         if buffer is not None:
-                                #             photo_bytes = buffer.tobytes()
-                                #             current_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                                #             self.insert_car_data(
-                                #                 plate_text,
-                                #                 photo_bytes,
-                                #                 car_type,
-                                #                 current_date,
-                                #                 self.camera_names[idx] if idx < len(self.camera_names) else None
-                                #             )
-                                #             setattr(self, f'last_saved_plate_{camera_id}', plate_text)
-                                #     except Exception as e:
-                                #         logging.error(f"Ошибка при сохранении в БД: {e}")
-
-                            processed_frame = draw_license_plate_text(
-                                processed_frame,
-                                display_text,
-                                (10, 110)
-                            )
+                # 4. Очистка старых треков (>5 секунд без обновления)
+                to_delete = [tid for tid, plate in self.tracked_plates.items()
+                             if current_time - plate['last_seen'] > 5.0]
+                for tid in to_delete:
+                    del self.tracked_plates[tid]
 
                 # Отображение FPS
                 if self.show_fps:
-                    current_fps = self.calculate_fps(start_time)
-                    processed_frame = draw_license_plate_text(
-                        processed_frame,
-                        f"FPS: {current_fps:.2f}",
-                        (10, 30)
-                    )
+                    fps = 1.0 / (time.time() - start_time)
+                    fps_text = f"FPS: {fps:.2f}"
+                    fps_bbox = draw.textbbox((0, 0), fps_text, font=font_small)
+                    draw.rectangle(
+                        [10, 10, 10 + (fps_bbox[2] - fps_bbox[0]) + 10, 10 + (fps_bbox[3] - fps_bbox[1]) + 10],
+                        fill=(0, 0, 0, 128))
+                    draw.text((15, 15), fps_text, font=font_small, fill=(0, 255, 0))
 
+                # Отображение названия камеры
+                name_bbox = draw.textbbox((0, 0), camera_name, font=font_small)
+                draw.rectangle(
+                    [10, 40, 10 + (name_bbox[2] - name_bbox[0]) + 10, 40 + (name_bbox[3] - name_bbox[1]) + 10],
+                    fill=(0, 0, 0, 128))
+                draw.text((15, 45), camera_name, font=font_small, fill=(255, 255, 255))
+
+                # Конвертируем обратно в OpenCV формат
+                processed_frame = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
                 self.display_processed_frame(processed_frame, video_label)
 
+                # Отправка на сервер при необходимости
                 if self.is_streaming:
                     self.send_frame_to_stream(processed_frame, idx)
 
@@ -1537,7 +1586,7 @@ class VideoApp(QWidget):
                 torch.cuda.empty_cache()
                 self.restart_video_streams()
             else:
-                logging.error(f"Runtime error: {e}")
+                logging.error(f"Runtime error in update_frame: {e}")
         except Exception as e:
             logging.error(f"Unexpected error in update_frame: {e}")
             self.release_cameras()
