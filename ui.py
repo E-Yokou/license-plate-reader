@@ -13,7 +13,7 @@ from PyQt5.QtWidgets import (
     QWidget, QLabel, QSizePolicy, QTextEdit, QPushButton, QVBoxLayout, QApplication,
     QMenuBar, QMenu, QAction, QInputDialog, QLineEdit, QCheckBox, QDialog,
     QFormLayout, QGroupBox, QHBoxLayout, QFileDialog, QMessageBox, QComboBox, QTableWidgetItem, QDialogButtonBox,
-    QTableWidget, QListWidgetItem, QListWidget, QGridLayout
+    QTableWidget, QListWidgetItem, QListWidget, QGridLayout, QSlider, QDoubleSpinBox, QSpinBox
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QImage, QPixmap, QColor, QPainter, QPen
@@ -38,6 +38,74 @@ def get_available_usb_cameras(max_to_check=5):
             available_cameras.append(i)
             cap.release()
     return available_cameras
+
+
+class StreamingSettingsDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Настройки трансляции")
+        self.parent = parent
+
+        self.layout = QVBoxLayout()
+        self.setLayout(self.layout)
+
+        # Группа настроек частоты
+        freq_group = QGroupBox("Частота отправки")
+        freq_layout = QFormLayout()
+
+        self.interval_spin = QDoubleSpinBox()
+        self.interval_spin.setRange(0.01, 5.0)
+        self.interval_spin.setSingleStep(0.05)
+        self.interval_spin.setSuffix(" сек")
+        freq_layout.addRow("Интервал между кадрами:", self.interval_spin)
+
+        self.threads_spin = QSpinBox()
+        self.threads_spin.setRange(1, 10)
+        freq_layout.addRow("Количество потоков:", self.threads_spin)
+
+        freq_group.setLayout(freq_layout)
+        self.layout.addWidget(freq_group)
+
+        # Группа настроек качества
+        quality_group = QGroupBox("Качество изображения")
+        quality_layout = QFormLayout()
+
+        self.resolution_combo = QComboBox()
+        self.resolution_combo.addItems(["640x480", "1280x720", "1920x1080", "Исходное"])
+        quality_layout.addRow("Разрешение:", self.resolution_combo)
+
+        self.quality_slider = QSlider(Qt.Horizontal)
+        self.quality_slider.setRange(30, 100)
+        self.quality_slider.setTickInterval(10)
+        self.quality_slider.setTickPosition(QSlider.TicksBelow)
+        quality_layout.addRow("Качество JPEG (%):", self.quality_slider)
+
+        quality_group.setLayout(quality_layout)
+        self.layout.addWidget(quality_group)
+
+        # Кнопки
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        self.layout.addWidget(buttons)
+
+    def set_values(self, interval, threads, resolution, quality):
+        self.interval_spin.setValue(interval)
+        self.threads_spin.setValue(threads)
+
+        index = self.resolution_combo.findText(resolution)
+        if index >= 0:
+            self.resolution_combo.setCurrentIndex(index)
+
+        self.quality_slider.setValue(quality)
+
+    def get_values(self):
+        return {
+            'interval': self.interval_spin.value(),
+            'threads': self.threads_spin.value(),
+            'resolution': self.resolution_combo.currentText(),
+            'quality': self.quality_slider.value()
+        }
 
 class CameraSelectionDialog(QDialog):
     def __init__(self, parent=None):
@@ -479,6 +547,19 @@ class VideoApp(QWidget):
         self.recognized_plates = set()
         self.frame_times = []
 
+        # Настроки трансляции
+        self.streaming_interval = 0.1
+        self.last_streaming_time = 0
+        self.streaming_threads = []
+        self.streaming_queue = queue.Queue(maxsize=10)
+
+        self.streaming_settings = {
+            'interval': 0.1,
+            'threads': 3,
+            'resolution': '1280x720',
+            'quality': 70
+        }
+
         self.tracked_plates = {}
         self.tracked_plates = {}  # {track_id: {'plate_text': str, 'plate_score': float, 'last_seen': float}}
         self.plate_history = {}  # Для хранения истории номеров
@@ -586,9 +667,14 @@ class VideoApp(QWidget):
 
         # Stream menu
         self.stream_menu = QMenu("Трансляция", self.menu_bar)
+
         self.stream_settings_action = QAction("Настройки сервера", self)
         self.stream_settings_action.triggered.connect(self.show_server_settings)
         self.stream_menu.addAction(self.stream_settings_action)
+
+        self.stream_params_action = QAction("Параметры трансляции", self)
+        self.stream_params_action.triggered.connect(self.show_streaming_settings)
+        self.stream_menu.addAction(self.stream_params_action)
 
         self.stream_action = QAction("Трансляция на сервер", self, checkable=True)
         self.stream_action.triggered.connect(self.toggle_streaming)
@@ -626,6 +712,51 @@ class VideoApp(QWidget):
         self.status_bar.addStretch()
 
         layout.addLayout(self.status_bar)
+
+    def prepare_frame_for_streaming(self, frame):
+        """Подготавливает кадр для отправки согласно настройкам"""
+        try:
+            # Изменяем разрешение
+            if self.streaming_settings['resolution'] != "Исходное":
+                width, height = map(int, self.streaming_settings['resolution'].split('x'))
+                frame = cv2.resize(frame, (width, height))
+
+            # Кодируем в JPEG с заданным качеством
+            quality = self.streaming_settings['quality']
+            success, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
+
+            if not success:
+                logging.error("Failed to encode frame to JPEG")
+                return None
+
+            return buffer
+
+        except Exception as e:
+            logging.error(f"Error preparing frame: {e}")
+            return None
+
+    def show_streaming_settings(self):
+        try:
+            dialog = StreamingSettingsDialog(self)
+            dialog.set_values(
+                self.streaming_settings['interval'],
+                self.streaming_settings['threads'],
+                self.streaming_settings['resolution'],
+                self.streaming_settings['quality']
+            )
+
+            if dialog.exec_():
+                new_settings = dialog.get_values()
+                self.streaming_settings.update(new_settings)
+
+                # Применяем новые настройки
+                self.start_streaming_threads(self.streaming_settings['threads'])
+
+                logging.info(f"Streaming settings updated: {self.streaming_settings}")
+
+        except Exception as e:
+            logging.error(f"Error in streaming settings dialog: {e}")
+            QMessageBox.critical(self, "Ошибка", f"Ошибка в настройках трансляции: {str(e)}")
 
     def toggle_template_processing(self):
         """Включает/выключает обработку текста под шаблоны номерных знаков"""
@@ -1266,64 +1397,73 @@ class VideoApp(QWidget):
     def start_streaming(self):
         if not self.is_streaming:
             self.is_streaming = True
+            self.start_streaming_threads()  # Запускаем потоки
             logging.info("Трансляция на сервер запущена")
             self.connection_status_changed.emit("connected")
 
     def stop_streaming(self):
         if self.is_streaming:
             self.is_streaming = False
+            self.stop_streaming_threads()  # Останавливаем потоки
             logging.info("Трансляция на сервер остановлена")
             if self.connection_status == "connected":
                 self.connection_status_changed.emit("disconnected")
 
+    def set_streaming_settings(self):
+        """Настройка параметров трансляции"""
+        try:
+            interval, ok = QInputDialog.getDouble(
+                self, "Интервал трансляции",
+                "Введите интервал между кадрами (секунды):",
+                self.streaming_interval, 0.01, 1.0, 2
+            )
+            if ok:
+                self.streaming_interval = interval
+
+            threads, ok = QInputDialog.getInt(
+                self, "Количество потоков",
+                "Введите количество потоков для отправки:",
+                len(self.streaming_threads), 1, 10, 1
+            )
+            if ok:
+                self.start_streaming_threads(threads)
+
+        except Exception as e:
+            logging.error(f"Error setting streaming params: {e}")
+
     def send_frame(self, frame, camera_id):
-        """Отправляет кадр на сервер трансляции с минимальными данными о камере"""
+        """Отправляет кадр на сервер трансляции"""
         try:
             if not self.server_ip or not self.server_port:
                 logging.error("Server IP or port not set")
                 return False
 
-            # Получаем только необходимые данные о камере
-            camera_data = self.camera_info.get(camera_id)
-            if not camera_data:
-                logging.error(f"No camera info for id: {camera_id}")
+            # Подготавливаем кадр
+            buffer = self.prepare_frame_for_streaming(frame)
+            if buffer is None:
                 return False
 
-            # Подготовка кадра (уменьшаем размер для экономии трафика)
-            small_frame = cv2.resize(frame, (1280, 720))
-            success, buffer = cv2.imencode('.jpg', small_frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
-            if not success:
-                logging.error("Failed to encode frame to JPEG")
-                return False
-
-            # Формируем минимальный payload
+            # Формируем payload
             payload = {
                 "camera_id": str(camera_id),
-                "camera_ip": camera_data['ip'],
-                "frame": base64.b64encode(buffer).decode('utf-8')
+                "timestamp": datetime.now().isoformat(),
+                "frame": base64.b64encode(buffer).decode('utf-8'),
+                "settings": self.streaming_settings
             }
 
-            logging.debug(f"Sending frame from camera {camera_id}")
-
             # Отправка на сервер
-            try:
-                response = requests.post(
-                    f"http://{self.server_ip}:{self.server_port}/upload",
-                    json=payload,
-                    timeout=2.0
-                )
+            response = requests.post(
+                f"http://{self.server_ip}:{self.server_port}/upload",
+                json=payload,
+                timeout=1.0
+            )
 
-                if response.status_code != 200:
-                    logging.error(f"Server error: {response.status_code} - {response.text}")
-                    self.connection_status_changed.emit("disconnected")
-                    return False
-
-                return True
-
-            except requests.exceptions.RequestException as e:
-                logging.error(f"Network error: {e}")
+            if response.status_code != 200:
+                logging.error(f"Server error: {response.status_code} - {response.text}")
                 self.connection_status_changed.emit("disconnected")
                 return False
+
+            return True
 
         except Exception as e:
             logging.error(f"Error in send_frame: {e}")
@@ -1373,8 +1513,6 @@ class VideoApp(QWidget):
             dialog = CameraManagementDialog(self)
             dialog.exec_()
 
-            # После закрытия диалога можно обновить список камер в настройках
-            # Например, если были добавлены новые камеры
             self.update_camera_list_from_db()
         except Exception as e:
             logging.error(f"Error in camera management dialog: {e}")
@@ -1389,7 +1527,6 @@ class VideoApp(QWidget):
             cursor.execute("SELECT ip_address FROM camera")
             cameras = cursor.fetchall()
 
-            # Обновляем self.camera_urls (первые две камеры)
             for i, camera in enumerate(cameras[:2]):
                 self.camera_urls[i] = camera['ip_address']
 
@@ -1404,7 +1541,6 @@ class VideoApp(QWidget):
             if not self.video_labels:
                 return
 
-            # Загрузка шрифта DejaVuSans с fallback
             try:
                 font = ImageFont.truetype("DejaVuSans.ttf", 24)
                 font_small = ImageFont.truetype("DejaVuSans.ttf", 18)
@@ -1617,74 +1753,6 @@ class VideoApp(QWidget):
         except Exception as e:
             logging.error(f"Ошибка при сохранении в БД: {e}")
 
-    # def update_frame(self):
-    #     try:
-    #         if not any([self.cap1, self.cap2, self.video_cap, hasattr(self, 'usb_cap')]):
-    #             return
-    #
-    #         start_time = time.time()
-    #         ret, frame = self.get_current_frame()
-    #         if not ret or frame is None:
-    #             return
-    #
-    #         frame = cv2.resize(frame, (1920, 1080))
-    #         results = model_prediction(frame, self.coco_model, self.license_plate_detector, reader)
-    #
-    #         # Обработка всех обнаруженных номеров
-    #         if len(results) >= 6:  # Теперь возвращается 6 значений
-    #             processed_frame, texts, crops, current_best_text, current_best_score, direction = results
-    #
-    #             # Обновляем лучший результат
-    #             if current_best_score > getattr(self, 'best_score', 0):
-    #                 self.best_text = current_best_text
-    #                 self.best_score = current_best_score
-    #                 self.last_direction = direction  # Сохраняем направление
-    #                 logging.info(
-    #                     f"Новый лучший результат: {self.best_text} ({self.best_score:.2f}), направление: {direction}")
-    #
-    #             # Новая логика вывода номеров
-    #             if current_best_score > 0.85:
-    #                 if self.last_recognized_plate != current_best_text:
-    #                     # Это новый номер, отличающийся от предыдущего
-    #                     display_text = f"{current_best_text} ({current_best_score:.2f})"
-    #                     if direction:
-    #                         display_text += f" ({direction})"
-    #                     self.plate_text_display.append(display_text)
-    #                     self.last_recognized_plate = current_best_text
-    #                     self.last_recognized_score = current_best_score
-    #                     logging.info(f"Отображен новый номер: {current_best_text}, направление: {direction}")
-    #
-    #         # Отображение FPS
-    #         if self.show_fps:
-    #             current_fps = self.calculate_fps(start_time)
-    #             processed_frame = draw_license_plate_text(
-    #                 processed_frame,
-    #                 f"FPS: {current_fps:.2f}",
-    #                 (10, 10)
-    #             )
-    #
-    #         # Отображение лучшего результата с направлением
-    #         if hasattr(self, 'best_text') and hasattr(self, 'best_score'):
-    #             if self.best_score > 0.85:
-    #                 display_text = f"{self.best_text} ({self.best_score:.2f})"
-    #                 if hasattr(self, 'last_direction') and self.last_direction:
-    #                     display_text += f" {self.last_direction}"
-    #
-    #                 processed_frame = draw_best_result(
-    #                     processed_frame,
-    #                     display_text,
-    #                     self.best_score,
-    #                     (10, 350)
-    #                 )
-    #
-    #         self.display_processed_frame(processed_frame)
-    #
-    #         if self.is_streaming:
-    #             self.send_frame_to_stream(processed_frame)
-    #
-    #     except Exception as e:
-    #         logging.error(f"Error in update_frame: {e}")
-
     def get_current_frame(self):
         """Получает текущий кадр из активного источника"""
         if self.current_camera == "Камера 1" and self.cap1 and self.cap1.isOpened():
@@ -1781,29 +1849,37 @@ class VideoApp(QWidget):
             video_label.setPixmap(pixmap)
 
     def send_frame_to_stream(self, frame, camera_idx):
-        """Отправляет кадр на сервер трансляции"""
+        """Добавляет кадр в очередь для отправки на сервер"""
         try:
+            current_time = time.time()
+            last_time = getattr(self, f'last_send_time_{camera_idx}', 0)
+
+            # Проверяем интервал для этой камеры
+            if current_time - last_time < self.streaming_settings['interval']:
+                return  # Пропускаем кадр, если не прошло достаточно времени
+
             # Используем camera_idx напрямую, если camera_ids не заполнен
             camera_id = camera_idx
             if camera_idx < len(self.camera_ids):
                 camera_id = self.camera_ids[camera_idx]
 
-            self.frame_queue.put_nowait((frame.copy(), camera_id))
-        except queue.Full:
-            pass
+            # Добавляем в очередь, если есть место
+            try:
+                self.streaming_queue.put_nowait((frame.copy(), camera_id))
+                setattr(self, f'last_send_time_{camera_idx}', current_time)
+            except queue.Full:
+                pass
+
+        except Exception as e:
+            logging.error(f"Error in send_frame_to_stream: {e}")
 
     def streaming_worker(self):
         """Рабочий поток для отправки кадров на сервер"""
         while True:
             try:
-                frame, camera_idx = self.frame_queue.get()
+                frame, camera_id = self.streaming_queue.get()
                 if frame is None:  # Сигнал остановки
                     break
-
-                # Получаем camera_id
-                camera_id = camera_idx
-                if camera_idx < len(self.camera_ids):
-                    camera_id = self.camera_ids[camera_idx]
 
                 # Отправляем только если трансляция активна
                 if self.is_streaming:
@@ -1811,7 +1887,27 @@ class VideoApp(QWidget):
 
             except Exception as e:
                 logging.error(f"Error in streaming worker: {e}")
-                time.sleep(1)  # Задержка при ошибках
+                time.sleep(0.1)  # задержка при ошибках
+
+    def start_streaming_threads(self, num_threads=3):
+        """Запускает несколько потоков для отправки кадров"""
+        self.stop_streaming_threads()  # Останавливаем существующие потоки
+
+        for _ in range(num_threads):
+            thread = threading.Thread(target=self.streaming_worker, daemon=True)
+            thread.start()
+            self.streaming_threads.append(thread)
+
+    def stop_streaming_threads(self):
+        """Останавливает все потоки отправки"""
+        for _ in range(len(self.streaming_threads)):
+            self.streaming_queue.put(None)  # Отправляем сигнал остановки
+
+        for thread in self.streaming_threads:
+            if thread.is_alive():
+                thread.join(timeout=1.0)
+
+        self.streaming_threads = []
 
     def closeEvent(self, event):
         try:
