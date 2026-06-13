@@ -5,24 +5,13 @@ import logging
 import numpy as np
 import cv2
 import re
-import mysql.connector
 from PIL import ImageFont, ImageDraw, Image
-from PyQt5.QtWidgets import QApplication
 
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Initialize the OCR reader
 reader = easyocr.Reader(['ru'], gpu=False)
 
-# Database configuration
-db_config = {
-    'host': '192.168.1.159',
-    'port': 3306,
-    'user': 'iwillnvrd',
-    'password': 'SecurePass1212_',
-    'database': 'mydatabase',
-    'connect_timeout': 5
-}
 
 dict_char_to_int = {
     'О': '0', 'о': '0', 'Ы': 'М', 'Ч': 'У',
@@ -116,7 +105,6 @@ def is_plate_inside_car(plate_bbox, car_bbox):
 
 def model_prediction(img, coco_model, license_plate_detector, ocr_reader, recognition_threshold=0.85):
     """Обработка изображения для обнаружения автомобилей и номерных знаков с улучшенным сопоставлением"""
-    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR) if len(img.shape) == 3 else img
     licenses_texts = []
     license_plate_crops = []
     direction = None
@@ -308,10 +296,6 @@ def draw_license_plate_text(image, text, position, font_size=30, bg_color=(255, 
 
 def license_complies_format(text, recognition_threshold=0.85):
     """Проверка формата номера (Российский стандарт)"""
-    # Если обработка под шаблоны отключена, всегда возвращаем True
-    if not getattr(QApplication.instance(), 'template_processing_enabled', True):
-        return True
-
     # car
     if len(text) == 9 and text[0].isalpha() and text[1:4].isdigit() and text[4:6].isalpha() and text[6:].isdigit():
         return True
@@ -503,44 +487,3 @@ def get_car(license_plate, vehicle_track_ids):
     return -1, -1, -1, -1, -1
 
 
-def insert_car_data(license_plate_text, photo, car_type, date, camera_id):
-    """Insert car data into the database with duplicate check."""
-    conn = None
-    try:
-        conn = mysql.connector.connect(**db_config)
-        cursor = conn.cursor()
-
-        # First, check if this plate was already recorded recently (last 5 minutes)
-        check_query = """
-        SELECT id FROM car 
-        WHERE car_number = %s AND date >= DATE_SUB(%s, INTERVAL 1 MINUTE)
-        LIMIT 1
-        """
-        cursor.execute(check_query, (license_plate_text, date))
-        if cursor.fetchone():
-            logging.info(f"Plate {license_plate_text} already recorded recently - skipping")
-            return
-
-        # Get camera ID if camera name was provided
-        if camera_id and not str(camera_id).isdigit():
-            cursor.execute("SELECT id FROM camera WHERE name = %s", (camera_id,))
-            result = cursor.fetchone()
-            if result:
-                camera_id = result[0]
-            else:
-                camera_id = None
-
-        insert_query = """
-        INSERT INTO car (photo, car_type, car_number, date, camera_id)
-        VALUES (%s, %s, %s, %s, %s)
-        """
-        cursor.execute(insert_query, (photo, car_type, license_plate_text, date, camera_id))
-        conn.commit()
-        logging.info(f"Successfully inserted plate: {license_plate_text}")
-
-    except mysql.connector.Error as err:
-        logging.error(f"MySQL error: {err}")
-    finally:
-        if conn and conn.is_connected():
-            cursor.close()
-            conn.close()

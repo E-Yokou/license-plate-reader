@@ -6,7 +6,7 @@ from PyQt5.QtWidgets import QApplication
 from sort.sort import Sort
 from ultralytics import YOLO
 from ui import VideoApp
-from util import read_license_plate, get_car, insert_car_data
+from util import read_license_plate, get_car
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -22,11 +22,11 @@ def main():
         sys.exit(1)
 
     mot_tracker = Sort()
-    vehicles = [2, 3, 5, 7]  # IDs of vehicles in COCO
+    vehicles = [2, 3, 5, 7]
 
     app = QApplication(sys.argv)
     window = VideoApp(coco_model, license_plate_detector, mot_tracker,
-                     vehicles, get_car, read_license_plate, insert_car_data)
+                     vehicles, get_car, read_license_plate)
     window.show()
     logging.info("Application started.")
     sys.exit(app.exec_())
