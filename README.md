@@ -38,7 +38,7 @@
 
 ```bash
 # Клонировать репозиторий
-git clone https://github.com/<your-username>/local-license-plate-reader.git
+git clone https://github.com/E-Yokou/license-plate-reader.git
 cd local-license-plate-reader
 
 # Создать виртуальное окружение
